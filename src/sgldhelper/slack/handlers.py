@@ -13,10 +13,17 @@ from sgldhelper.config import Settings
 from sgldhelper.db.engine import Database
 from sgldhelper.db import queries
 from sgldhelper.github.ci_rerunner import CIRerunner
+from sgldhelper.github.client import GitHubNotConfiguredError
 from sgldhelper.github.issue_tracker import IssueTracker
 from sgldhelper.slack.app import SlackApp
 from sgldhelper.slack.channels import ChannelRouter
 from sgldhelper.slack import messages
+
+_GITHUB_NOT_CONFIGURED_MSG = (
+    ":warning: *GITHUB_TOKEN is not configured.* "
+    "This operation requires GitHub access. "
+    "Please set `GITHUB_TOKEN` in your `.env` file and restart."
+)
 
 if TYPE_CHECKING:
     from sgldhelper.ai.classifier import MessageClassifier
@@ -88,7 +95,12 @@ def register_handlers(
             await respond(f"Invalid PR number: `{text}`")
             return
 
-        results = await rerunner.manual_rerun(pr_number)
+        try:
+            results = await rerunner.manual_rerun(pr_number)
+        except GitHubNotConfiguredError:
+            await respond(_GITHUB_NOT_CONFIGURED_MSG)
+            return
+
         if not results:
             await respond(f"No failed CI runs found for PR #{pr_number}")
             return
@@ -107,6 +119,9 @@ def register_handlers(
                 progress = await issue_tracker.get_progress(issue_num)
                 msg = messages.build_feature_progress(progress, settings.github_repo)
                 await respond(blocks=msg["blocks"], text=msg["text"])
+            except GitHubNotConfiguredError:
+                await respond(_GITHUB_NOT_CONFIGURED_MSG)
+                return
             except Exception as e:
                 await respond(f"Error fetching issue #{issue_num}: {e}")
 
@@ -121,7 +136,12 @@ def register_handlers(
         user = body["user"]["username"]
         log.info("ci.manual_rerun_button", user=user, run_id=run_id, pr=pr_number)
 
-        results = await rerunner.manual_rerun(pr_number)
+        try:
+            results = await rerunner.manual_rerun(pr_number)
+        except GitHubNotConfiguredError:
+            await respond(_GITHUB_NOT_CONFIGURED_MSG)
+            return
+
         triggered = [r for r in results if r.triggered]
         if triggered:
             await respond(
@@ -159,40 +179,71 @@ def register_handlers(
     # ------------------------------------------------------------------
 
     if settings.ai_enabled and conversation_manager:
+        monitored_channels = {
+            channels.pr_channel, channels.ci_channel, channels.features_channel
+        }
+        log.info(
+            "handlers.registered",
+            monitored_channels=list(monitored_channels),
+            ai_enabled=True,
+        )
 
-        @app.event("app_mention")
-        async def handle_app_mention(event, say):
-            """Handle @bot mentions — route to Kimi K2.5 conversation."""
+        @app.event("message")
+        async def handle_message(event, say):
+            """Respond to ALL messages in monitored channels via AI."""
+            # Skip subtypes: bot messages, edits, joins, etc.
+            if event.get("subtype"):
+                return
+            # Skip bot's own messages to avoid infinite loops
+            if event.get("bot_id") or event.get("user") == slack_app.bot_user_id:
+                return
+
+            channel = event.get("channel", "")
+            if channel not in monitored_channels:
+                return
+
             user_id = event.get("user", "")
             text = event.get("text", "")
-            channel = event.get("channel", "")
-            thread_ts = event.get("thread_ts") or event.get("ts", "")
+            message_ts = event.get("ts", "")
+            thread_ts = event.get("thread_ts") or message_ts
 
-            # Strip the bot mention from text
+            # Strip any bot mentions from text
             text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
             if not text:
-                await say("How can I help? Ask me about PRs, CI, or features.", thread_ts=thread_ts)
                 return
 
             # Rate limit check
             if not _check_user_rate_limit(
                 user_id, settings.ai_user_cooldown_max, settings.ai_user_cooldown_seconds
             ):
-                await say(
-                    "You're sending messages too fast. Please wait a moment.",
-                    thread_ts=thread_ts,
-                )
-                return
+                return  # Silently drop when rate-limited on passive replies
 
             # Add thinking reaction
             try:
                 await app.client.reactions_add(
-                    channel=channel, timestamp=event["ts"], name="thinking_face"
+                    channel=channel, timestamp=message_ts, name="thinking_face"
                 )
             except Exception:
                 pass
 
             try:
+                # Run classifier in parallel if available
+                if classifier:
+                    try:
+                        cls_result = await classifier.classify_message(
+                            text=text, user_id=user_id,
+                            channel_id=channel, message_ts=message_ts,
+                        )
+                        if cls_result:
+                            msg = messages.build_progress_confirmation(cls_result)
+                            await say(
+                                blocks=msg["blocks"], text=msg["text"],
+                                thread_ts=thread_ts,
+                            )
+                    except Exception as e:
+                        log.error("ai.classify_failed", error=str(e))
+
+                # Always reply via conversation manager
                 reply = await conversation_manager.handle_mention(
                     text=text,
                     thread_ts=thread_ts,
@@ -201,62 +252,67 @@ def register_handlers(
                 )
                 await say(reply, thread_ts=thread_ts)
             except Exception as e:
-                log.error("ai.mention_failed", error=str(e), user=user_id)
+                log.error("ai.reply_failed", error=str(e), user=user_id)
                 await say(
-                    "Sorry, I encountered an error. Try a slash command instead:\n"
-                    "- `/diffusion-status` — open PRs\n"
-                    "- `/diffusion-features` — feature progress",
+                    "Sorry, I encountered an error processing your message.",
                     thread_ts=thread_ts,
                 )
             finally:
-                # Remove thinking reaction
                 try:
                     await app.client.reactions_remove(
-                        channel=channel, timestamp=event["ts"], name="thinking_face"
+                        channel=channel, timestamp=message_ts, name="thinking_face"
                     )
                 except Exception:
                     pass
 
-    if settings.ai_enabled and classifier:
-        monitored_channels = {
-            channels.pr_channel, channels.ci_channel, channels.features_channel
-        }
+        @app.event("app_mention")
+        async def handle_app_mention(event, say):
+            """Handle @mentions — also routed through conversation manager.
 
-        @app.event("message")
-        async def handle_message(event, say):
-            """Passively classify messages in monitored channels."""
-            # Skip bot messages and message changes
-            if event.get("subtype"):
-                return
+            In channels outside the monitored set, @mention still works.
+            In monitored channels, the message handler already handles it,
+            so we only process mentions from non-monitored channels here.
+            """
             channel = event.get("channel", "")
-            if channel not in monitored_channels:
+            if channel in monitored_channels:
+                return  # Already handled by message handler
+
+            user_id = event.get("user", "")
+            text = event.get("text", "")
+            message_ts = event.get("ts", "")
+            thread_ts = event.get("thread_ts") or message_ts
+
+            text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+            if not text:
+                await say("How can I help? Ask me about PRs, CI, or features.", thread_ts=thread_ts)
                 return
 
-            text = event.get("text", "")
-            user_id = event.get("user", "")
-            message_ts = event.get("ts", "")
+            if not _check_user_rate_limit(
+                user_id, settings.ai_user_cooldown_max, settings.ai_user_cooldown_seconds
+            ):
+                await say("You're sending messages too fast. Please wait a moment.", thread_ts=thread_ts)
+                return
 
             try:
-                result = await classifier.classify_message(
-                    text=text,
-                    user_id=user_id,
-                    channel_id=channel,
-                    message_ts=message_ts,
+                await app.client.reactions_add(channel=channel, timestamp=message_ts, name="thinking_face")
+            except Exception:
+                pass
+
+            try:
+                reply = await conversation_manager.handle_mention(
+                    text=text, thread_ts=thread_ts, channel_id=channel, user_id=user_id,
                 )
+                await say(reply, thread_ts=thread_ts)
             except Exception as e:
-                log.error("ai.classify_failed", error=str(e))
-                return
+                log.error("ai.mention_failed", error=str(e), user=user_id)
+                await say("Sorry, I encountered an error.", thread_ts=thread_ts)
+            finally:
+                try:
+                    await app.client.reactions_remove(channel=channel, timestamp=message_ts, name="thinking_face")
+                except Exception:
+                    pass
 
-            if not result:
-                return
-
-            # Send confirmation button
-            msg = messages.build_progress_confirmation(result)
-            await say(
-                blocks=msg["blocks"],
-                text=msg["text"],
-                thread_ts=message_ts,
-            )
+    if settings.ai_enabled and classifier:
 
         @app.action("confirm_update")
         async def handle_confirm_update(ack, body, respond):
@@ -264,7 +320,6 @@ def register_handlers(
             await ack()
             update_id = int(body["actions"][0]["value"])
             user = body["user"]["username"]
-
             await queries.confirm_detected_update(db.conn, update_id)
             await respond(f":white_check_mark: Update confirmed by @{user}. Progress recorded.")
 

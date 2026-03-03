@@ -16,6 +16,8 @@ from sgldhelper.config import Settings
 
 log = structlog.get_logger()
 
+_DIFF_MAX_CHARS = 30_000
+
 
 class ToolRegistry:
     """Registry of tools exposed to Kimi K2.5 via function calling.
@@ -168,6 +170,82 @@ class ToolRegistry:
             requires_confirmation=True,
         )
 
+        self._register(
+            name="get_my_preferences",
+            description="Get the current user's saved preferences, tracked PRs, focus areas, and notes",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=self._get_my_preferences,
+        )
+
+        self._register(
+            name="update_tracked_prs",
+            description="Add or remove PRs from the current user's tracking list",
+            parameters={
+                "type": "object",
+                "required": ["action", "pr_numbers"],
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "remove"],
+                        "description": "Whether to add or remove PRs",
+                    },
+                    "pr_numbers": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of PR numbers to add or remove",
+                    },
+                },
+            },
+            handler=self._update_tracked_prs,
+        )
+
+        self._register(
+            name="save_user_note",
+            description="Save a note about the current user (e.g. their role, responsibilities, interests)",
+            parameters={
+                "type": "object",
+                "required": ["note"],
+                "properties": {
+                    "note": {"type": "string", "description": "Note to save about the user"},
+                },
+            },
+            handler=self._save_user_note,
+        )
+
+        self._register(
+            name="link_pr_to_feature",
+            description="Link a PR to a feature roadmap item so stall detection covers it",
+            parameters={
+                "type": "object",
+                "required": ["pr_number", "item_id"],
+                "properties": {
+                    "pr_number": {"type": "integer", "description": "PR number to link"},
+                    "item_id": {"type": "string", "description": "Feature item ID to bind the PR to"},
+                },
+            },
+            handler=self._link_pr_to_feature,
+        )
+
+        self._register(
+            name="get_unlinked_features",
+            description="List open feature items that have no linked PR (candidates for binding)",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=self._get_unlinked_features,
+        )
+
+        self._register(
+            name="review_pr_code",
+            description="Fetch the full diff of a PR for inline code review",
+            parameters={
+                "type": "object",
+                "required": ["pr_number"],
+                "properties": {
+                    "pr_number": {"type": "integer", "description": "PR number"},
+                },
+            },
+            handler=self._review_pr_code,
+        )
+
     def _register(
         self,
         name: str,
@@ -223,7 +301,27 @@ class ToolRegistry:
     # --- Tool handlers ---
 
     async def _get_open_prs(self) -> list[dict[str, Any]]:
-        return await queries.get_open_prs(self._db.conn)
+        db_prs = await queries.get_open_prs(self._db.conn)
+        if db_prs:
+            return db_prs
+        # DB is empty (pollers may not have run yet) — query GitHub directly
+        try:
+            gh_prs = await self._gh.get_open_pulls()
+            return [
+                {
+                    "pr_number": pr["number"],
+                    "title": pr["title"],
+                    "author": pr.get("user", {}).get("login", "unknown"),
+                    "state": pr["state"],
+                    "head_sha": pr.get("head", {}).get("sha", "")[:8],
+                    "updated_at": pr.get("updated_at", ""),
+                    "html_url": pr.get("html_url", ""),
+                }
+                for pr in gh_prs
+            ]
+        except Exception as e:
+            log.warning("tool.github_fallback_failed", error=str(e))
+            return []
 
     async def _get_pr_details(self, pr_number: int) -> dict[str, Any]:
         db_pr = await queries.get_pr(self._db.conn, pr_number)
@@ -247,19 +345,40 @@ class ToolRegistry:
             return {"error": f"PR #{pr_number} not found"}
 
     async def _get_ci_status(self, pr_number: int) -> list[dict[str, Any]]:
-        runs = await queries.get_ci_runs_for_pr(self._db.conn, pr_number)
-        return [
-            {
-                "run_id": r["run_id"],
-                "job_name": r["job_name"],
-                "status": r["status"],
-                "conclusion": r["conclusion"],
-                "failure_category": r["failure_category"],
-                "failure_summary": (r["failure_summary"] or "")[:300],
-                "auto_rerun_count": r["auto_rerun_count"],
-            }
-            for r in runs[:15]
-        ]
+        db_runs = await queries.get_ci_runs_for_pr(self._db.conn, pr_number)
+        if db_runs:
+            return [
+                {
+                    "run_id": r["run_id"],
+                    "job_name": r["job_name"],
+                    "status": r["status"],
+                    "conclusion": r["conclusion"],
+                    "failure_category": r["failure_category"],
+                    "failure_summary": (r["failure_summary"] or "")[:300],
+                    "auto_rerun_count": r["auto_rerun_count"],
+                }
+                for r in db_runs[:15]
+            ]
+        # Fallback: query GitHub directly for CI runs
+        try:
+            pr = await self._gh.get_pull(pr_number)
+            head_sha = pr.get("head", {}).get("sha", "")
+            if not head_sha:
+                return []
+            workflow_runs = await self._gh.get_workflow_runs_for_ref(head_sha)
+            results = []
+            for wr in workflow_runs[:10]:
+                results.append({
+                    "run_id": wr["id"],
+                    "job_name": wr.get("name", "unknown"),
+                    "status": wr.get("status", "unknown"),
+                    "conclusion": wr.get("conclusion"),
+                    "html_url": wr.get("html_url", ""),
+                })
+            return results
+        except Exception as e:
+            log.warning("tool.ci_github_fallback_failed", error=str(e))
+            return []
 
     async def _get_feature_progress(self, issue_number: int) -> dict[str, Any]:
         progress = await self._issue_tracker.get_progress(issue_number)
@@ -310,6 +429,58 @@ class ToolRegistry:
                 for r in results
             ],
         }
+
+    async def _get_my_preferences(self) -> dict[str, Any]:
+        from sgldhelper.ai.conversation import _current_user
+        user_id = _current_user.get()
+        mem = await queries.get_user_memory(self._db.conn, user_id)
+        if not mem:
+            return {"user_id": user_id, "tracked_prs": [], "focus_areas": [], "preferences": {}, "notes": ""}
+        return {
+            "user_id": user_id,
+            "tracked_prs": json.loads(mem["tracked_prs"]),
+            "focus_areas": json.loads(mem["focus_areas"]),
+            "preferences": json.loads(mem["preferences"]),
+            "notes": mem["notes"],
+        }
+
+    async def _update_tracked_prs(self, action: str, pr_numbers: list[int]) -> dict[str, Any]:
+        from sgldhelper.ai.conversation import _current_user
+        user_id = _current_user.get()
+        updated: list[int] = []
+        for pr in pr_numbers:
+            if action == "add":
+                updated = await queries.add_tracked_pr(self._db.conn, user_id, pr)
+            else:
+                updated = await queries.remove_tracked_pr(self._db.conn, user_id, pr)
+        return {"user_id": user_id, "action": action, "tracked_prs": updated}
+
+    async def _save_user_note(self, note: str) -> dict[str, Any]:
+        from sgldhelper.ai.conversation import _current_user
+        user_id = _current_user.get()
+        await queries.save_user_note(self._db.conn, user_id, note)
+        return {"user_id": user_id, "note": note, "saved": True}
+
+    async def _link_pr_to_feature(self, pr_number: int, item_id: str) -> dict[str, Any]:
+        pr = await queries.get_pr(self._db.conn, pr_number)
+        if not pr:
+            return {"error": f"PR #{pr_number} not found in database"}
+        updated = await queries.update_feature_linked_pr(self._db.conn, item_id, pr_number)
+        if not updated:
+            return {"error": f"Feature item '{item_id}' not found"}
+        return {"success": True, "item_id": item_id, "linked_pr": pr_number}
+
+    async def _get_unlinked_features(self) -> list[dict[str, Any]]:
+        return await queries.get_unlinked_features(self._db.conn)
+
+    async def _review_pr_code(self, pr_number: int) -> dict[str, Any]:
+        diff = await self._gh.get_pull_diff(pr_number)
+        if not diff:
+            return {"error": f"PR #{pr_number} returned an empty diff"}
+        truncated = len(diff) > _DIFF_MAX_CHARS
+        if truncated:
+            diff = diff[:_DIFF_MAX_CHARS]
+        return {"pr_number": pr_number, "diff": diff, "truncated": truncated}
 
 
 class _ToolDef:

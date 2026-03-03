@@ -66,7 +66,7 @@ async def registry(db, mock_gh, mock_rerunner, mock_issue_tracker, settings):
 class TestToolSchemas:
     def test_schemas_are_valid(self, registry):
         schemas = registry.get_schemas()
-        assert len(schemas) == 10
+        assert len(schemas) == 16
 
         for schema in schemas:
             assert schema["type"] == "function"
@@ -82,7 +82,9 @@ class TestToolSchemas:
             "get_open_prs", "get_pr_details", "get_ci_status",
             "get_feature_progress", "get_feature_items", "get_pr_reviews",
             "search_prs", "get_recent_activity", "get_stalled_features",
-            "rerun_ci",
+            "rerun_ci", "get_my_preferences", "update_tracked_prs",
+            "save_user_note", "link_pr_to_feature", "get_unlinked_features",
+            "review_pr_code",
         }
         assert names == expected
 
@@ -177,3 +179,117 @@ class TestToolExecution:
         result_str = await registry.execute("get_pr_details", {"pr_number": 1234})
         result = json.loads(result_str)
         assert result["title"] == "Add diffusion model"
+
+
+class TestFeatureBinding:
+    @pytest.mark.asyncio
+    async def test_get_unlinked_features(self, registry, db):
+        from sgldhelper.db import queries
+        # One open+unlinked, one open+linked, one completed+unlinked
+        await queries.upsert_feature_item(db.conn, {
+            "item_id": "14199/1", "parent_issue": 14199, "title": "SDXL support",
+            "item_type": "checkbox", "state": "open", "linked_pr": None,
+        })
+        await queries.upsert_feature_item(db.conn, {
+            "item_id": "14199/2", "parent_issue": 14199, "title": "ControlNet",
+            "item_type": "checkbox", "state": "open", "linked_pr": 5678,
+        })
+        await queries.upsert_feature_item(db.conn, {
+            "item_id": "14199/3", "parent_issue": 14199, "title": "Done item",
+            "item_type": "checkbox", "state": "completed", "linked_pr": None,
+        })
+        result_str = await registry.execute("get_unlinked_features", "{}")
+        result = json.loads(result_str)
+        assert len(result) == 1
+        assert result[0]["item_id"] == "14199/1"
+
+    @pytest.mark.asyncio
+    async def test_link_pr_to_feature_success(self, registry, db):
+        from sgldhelper.db import queries
+        await queries.upsert_pr(db.conn, {
+            "pr_number": 9999, "title": "Impl SDXL", "author": "alice",
+            "state": "open", "head_sha": "aaa111", "updated_at": "2025-03-01",
+            "changed_files": 3,
+        })
+        await queries.upsert_feature_item(db.conn, {
+            "item_id": "14199/1", "parent_issue": 14199, "title": "SDXL support",
+            "item_type": "checkbox", "state": "open",
+        })
+        result_str = await registry.execute(
+            "link_pr_to_feature", '{"pr_number": 9999, "item_id": "14199/1"}'
+        )
+        result = json.loads(result_str)
+        assert result["success"] is True
+        assert result["linked_pr"] == 9999
+
+    @pytest.mark.asyncio
+    async def test_link_pr_to_feature_invalid_pr(self, registry, db):
+        from sgldhelper.db import queries
+        await queries.upsert_feature_item(db.conn, {
+            "item_id": "14199/1", "parent_issue": 14199, "title": "SDXL support",
+            "item_type": "checkbox", "state": "open",
+        })
+        result_str = await registry.execute(
+            "link_pr_to_feature", '{"pr_number": 77777, "item_id": "14199/1"}'
+        )
+        result = json.loads(result_str)
+        assert "error" in result
+        assert "not found" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_link_pr_to_feature_invalid_item(self, registry, db):
+        from sgldhelper.db import queries
+        await queries.upsert_pr(db.conn, {
+            "pr_number": 9999, "title": "Impl SDXL", "author": "alice",
+            "state": "open", "head_sha": "aaa111", "updated_at": "2025-03-01",
+            "changed_files": 3,
+        })
+        result_str = await registry.execute(
+            "link_pr_to_feature", '{"pr_number": 9999, "item_id": "nonexistent/99"}'
+        )
+        result = json.loads(result_str)
+        assert "error" in result
+        assert "not found" in result["error"]
+
+
+class TestCodeReview:
+    @pytest.mark.asyncio
+    async def test_review_pr_code_returns_diff(self, registry, mock_gh):
+        mock_gh.get_pull_diff = AsyncMock(return_value="diff --git a/file.py b/file.py\n+hello")
+        result_str = await registry.execute("review_pr_code", '{"pr_number": 42}')
+        result = json.loads(result_str)
+        assert result["pr_number"] == 42
+        assert "diff --git" in result["diff"]
+        assert result["truncated"] is False
+        mock_gh.get_pull_diff.assert_called_once_with(42)
+
+    @pytest.mark.asyncio
+    async def test_review_pr_code_empty_diff(self, registry, mock_gh):
+        mock_gh.get_pull_diff = AsyncMock(return_value="")
+        result_str = await registry.execute("review_pr_code", '{"pr_number": 99}')
+        result = json.loads(result_str)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_review_pr_code_truncates_large_diff(self, registry, mock_gh):
+        from sgldhelper.ai.tools import _DIFF_MAX_CHARS
+        large_diff = "x" * (_DIFF_MAX_CHARS + 5000)
+        mock_gh.get_pull_diff = AsyncMock(return_value=large_diff)
+        result_str = await registry.execute("review_pr_code", '{"pr_number": 1}')
+        result = json.loads(result_str)
+        assert result["truncated"] is True
+        assert len(result["diff"]) == _DIFF_MAX_CHARS
+
+    @pytest.mark.asyncio
+    async def test_review_pr_code_not_truncated_at_limit(self, registry, mock_gh):
+        from sgldhelper.ai.tools import _DIFF_MAX_CHARS
+        exact_diff = "y" * _DIFF_MAX_CHARS
+        mock_gh.get_pull_diff = AsyncMock(return_value=exact_diff)
+        result_str = await registry.execute("review_pr_code", '{"pr_number": 2}')
+        result = json.loads(result_str)
+        assert result["truncated"] is False
+        assert len(result["diff"]) == _DIFF_MAX_CHARS
+
+    @pytest.mark.asyncio
+    async def test_review_pr_code_no_confirmation(self, registry):
+        assert registry.needs_confirmation("review_pr_code") is False

@@ -22,14 +22,14 @@ class Poller:
         self.name = name
         self.interval = interval
         self._callback = callback
-        self._running = False
+        self._stop_event = asyncio.Event()
 
     async def run(self) -> None:
         """Run the poller loop. Call within a TaskGroup or as a standalone task."""
-        self._running = True
+        self._stop_event.clear()
         log.info("poller.started", name=self.name, interval=self.interval)
 
-        while self._running:
+        while not self._stop_event.is_set():
             try:
                 await self._callback()
             except asyncio.CancelledError:
@@ -37,12 +37,17 @@ class Poller:
             except Exception:
                 log.exception("poller.error", name=self.name)
 
+            # Wait for interval OR stop signal, whichever comes first
             try:
-                await asyncio.sleep(self.interval)
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=self.interval
+                )
+            except asyncio.TimeoutError:
+                pass
             except asyncio.CancelledError:
                 break
 
         log.info("poller.stopped", name=self.name)
 
     def stop(self) -> None:
-        self._running = False
+        self._stop_event.set()

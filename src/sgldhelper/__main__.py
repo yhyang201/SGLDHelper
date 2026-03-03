@@ -20,13 +20,14 @@ from sgldhelper.notifications.dispatcher import NotificationDispatcher
 from sgldhelper.slack.app import SlackApp
 from sgldhelper.slack.channels import ChannelRouter
 from sgldhelper.slack.handlers import register_handlers
+from sgldhelper.db import queries
 from sgldhelper.slack import messages as slack_messages
 from sgldhelper.utils.logging_setup import setup_logging
 
 
 async def _run() -> None:
     settings = Settings()  # type: ignore[call-arg]
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, settings.log_dir)
     log = structlog.get_logger()
     log.info("starting", repo=settings.github_repo)
 
@@ -39,6 +40,11 @@ async def _run() -> None:
         settings.github_owner,
         settings.github_repo_name,
     )
+
+    if settings.github_configured:
+        log.info("github.enabled")
+    else:
+        log.warning("github.disabled", reason="GITHUB_TOKEN not set")
 
     pr_tracker = PRTracker(gh, db, settings)
     ci_analyzer = CIAnalyzer(gh, db, settings)
@@ -82,13 +88,29 @@ async def _run() -> None:
 
     # --- Define poll callbacks ---
     async def poll_prs() -> None:
+        from sgldhelper.github.pr_tracker import PREvent
+
         changes = await pr_tracker.poll()
         for change in changes:
+            if change.event == PREvent.OPENED:
+                try:
+                    await gh.create_issue_comment(
+                        change.pr["pr_number"], "/tag-and-rerun-ci"
+                    )
+                    log.info(
+                        "ci.initial_trigger",
+                        pr=change.pr["pr_number"],
+                        comment="/tag-and-rerun-ci",
+                    )
+                except Exception as exc:
+                    log.error(
+                        "ci.initial_trigger_failed",
+                        pr=change.pr["pr_number"],
+                        error=str(exc),
+                    )
             await dispatcher.pr.handle(change, db)
 
     async def poll_ci() -> None:
-        from sgldhelper.db import queries
-
         open_prs = await queries.get_open_prs(db.conn)
         for pr in open_prs:
             results = await ci_analyzer.analyze_pr(pr["pr_number"], pr["head_sha"])
@@ -117,7 +139,10 @@ async def _run() -> None:
             return
         alerts = await stall_detector.check_all()
         for alert in alerts:
-            msg = slack_messages.build_stall_alert(alert)
+            trackers: list[str] = []
+            if alert.pr_number:
+                trackers = await queries.get_users_tracking_pr(db.conn, alert.pr_number)
+            msg = slack_messages.build_stall_alert(alert, trackers=trackers)
             # Route stall alerts to the features channel
             await slack_app.post_message(
                 channels.features_channel,
@@ -125,11 +150,13 @@ async def _run() -> None:
                 blocks=msg["blocks"],
             )
 
+    pollers: list[Poller] = []
+
+    # Pollers work with public repos even without GITHUB_TOKEN (lower rate limit)
     pr_poller = Poller("pr", settings.pr_poll_interval, poll_prs)
     ci_poller = Poller("ci", settings.ci_poll_interval, poll_ci)
     feature_poller = Poller("feature", settings.feature_poll_interval, poll_features)
-
-    pollers = [pr_poller, ci_poller, feature_poller]
+    pollers.extend([pr_poller, ci_poller, feature_poller])
 
     if settings.ai_enabled and stall_detector:
         stall_poller = Poller("stall", settings.stall_check_interval, poll_stalls)

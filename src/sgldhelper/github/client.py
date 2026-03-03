@@ -13,6 +13,18 @@ log = structlog.get_logger()
 
 _NOT_MODIFIED = object()
 
+_NO_TOKEN_MSG = (
+    "GITHUB_TOKEN is not configured. "
+    "Set it in your .env file to enable GitHub integration."
+)
+
+
+class GitHubNotConfiguredError(Exception):
+    """Raised when a GitHub API call is attempted without a configured token."""
+
+    def __init__(self) -> None:
+        super().__init__(_NO_TOKEN_MSG)
+
 
 class GitHubClient:
     """httpx-based async GitHub REST API client.
@@ -28,17 +40,24 @@ class GitHubClient:
     def __init__(self, token: str, owner: str, repo: str) -> None:
         self._owner = owner
         self._repo = repo
+        self._configured = bool(token)
         self._limiter = TokenBucketLimiter()
         self._etag_cache: dict[str, tuple[str, Any]] = {}  # url -> (etag, data)
+        headers: dict[str, str] = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         self._client = httpx.AsyncClient(
             base_url=self.BASE_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
+            headers=headers,
             timeout=30.0,
         )
+
+    def _require_token(self) -> None:
+        if not self._configured:
+            raise GitHubNotConfiguredError()
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -117,6 +136,7 @@ class GitHubClient:
         json: dict[str, Any] | None = None,
     ) -> Any:
         """POST request (used for CI rerun etc.)."""
+        self._require_token()
         await self._limiter.acquire()
         url = self._repo_url(path)
         resp = await self._client.post(url, json=json)
@@ -159,11 +179,25 @@ class GitHubClient:
 
     async def get_job_logs(self, job_id: int) -> str:
         """Download job logs as text."""
+        self._require_token()
         await self._limiter.acquire()
         url = self._repo_url(f"actions/jobs/{job_id}/logs")
         resp = await self._client.get(url, follow_redirects=True)
         resp.raise_for_status()
         return resp.text
+
+    async def get_pull_diff(self, pr_number: int) -> str:
+        """Download PR diff from patch-diff.githubusercontent.com."""
+        self._require_token()
+        await self._limiter.acquire()
+        diff_url = (
+            f"https://patch-diff.githubusercontent.com/raw/"
+            f"{self._owner}/{self._repo}/pull/{pr_number}.diff"
+        )
+        async with httpx.AsyncClient(timeout=30.0) as tmp:
+            resp = await tmp.get(diff_url, follow_redirects=True)
+            resp.raise_for_status()
+            return resp.text
 
     async def rerun_failed_jobs(self, run_id: int) -> None:
         await self.post(f"actions/runs/{run_id}/rerun-failed-jobs")
@@ -175,3 +209,11 @@ class GitHubClient:
         self, issue_number: int
     ) -> list[dict[str, Any]]:
         return await self.get_paginated(f"issues/{issue_number}/comments")
+
+    async def create_issue_comment(
+        self, issue_number: int, body: str
+    ) -> dict[str, Any]:
+        """Create a comment on an issue or pull request."""
+        return await self.post(
+            f"issues/{issue_number}/comments", json={"body": body}
+        )

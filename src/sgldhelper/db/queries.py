@@ -240,6 +240,38 @@ async def get_feature_summary(
     return result
 
 
+async def update_feature_linked_pr(
+    conn: aiosqlite.Connection, item_id: str, pr_number: int
+) -> bool:
+    """Link a PR to a feature item. Returns True if the row was updated."""
+    cur = await conn.execute(
+        "UPDATE feature_items SET linked_pr = ? WHERE item_id = ?",
+        (pr_number, item_id),
+    )
+    await conn.commit()
+    return cur.rowcount > 0
+
+
+async def get_unlinked_features(conn: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """Return open feature items that have no linked PR."""
+    cur = await conn.execute(
+        "SELECT * FROM feature_items WHERE linked_pr IS NULL AND state = 'open' ORDER BY parent_issue, item_id"
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_users_tracking_pr(conn: aiosqlite.Connection, pr_number: int) -> list[str]:
+    """Return user IDs whose tracked_prs list contains *pr_number*."""
+    cur = await conn.execute("SELECT user_id, tracked_prs FROM user_memories")
+    rows = await cur.fetchall()
+    result: list[str] = []
+    for row in rows:
+        tracked = json.loads(row["tracked_prs"])
+        if pr_number in tracked:
+            result.append(row["user_id"])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Conversations (per-thread AI chat history)
 # ---------------------------------------------------------------------------
@@ -250,6 +282,7 @@ async def save_conversation_message(
     channel_id: str,
     role: str,
     content: str | None = None,
+    reasoning_content: str | None = None,
     tool_calls: str | None = None,
     tool_call_id: str | None = None,
     name: str | None = None,
@@ -258,9 +291,11 @@ async def save_conversation_message(
 ) -> None:
     await conn.execute(
         """INSERT INTO conversations
-            (thread_ts, channel_id, role, content, tool_calls, tool_call_id, name, tokens_in, tokens_out)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (thread_ts, channel_id, role, content, tool_calls, tool_call_id, name, tokens_in, tokens_out),
+            (thread_ts, channel_id, role, content, reasoning_content,
+             tool_calls, tool_call_id, name, tokens_in, tokens_out)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (thread_ts, channel_id, role, content, reasoning_content,
+         tool_calls, tool_call_id, name, tokens_in, tokens_out),
     )
     await conn.commit()
 
@@ -476,3 +511,116 @@ async def get_all_feature_items(
         "SELECT * FROM feature_items ORDER BY parent_issue, item_id"
     )
     return [dict(r) for r in await cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# User memories (per-user preference tracking)
+# ---------------------------------------------------------------------------
+
+async def get_user_memory(conn: aiosqlite.Connection, user_id: str) -> dict[str, Any] | None:
+    """Get the memory record for a user, or None if not found."""
+    cur = await conn.execute(
+        "SELECT * FROM user_memories WHERE user_id = ?", (user_id,)
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def upsert_user_memory(
+    conn: aiosqlite.Connection,
+    user_id: str,
+    *,
+    tracked_prs: list[int] | None = None,
+    focus_areas: list[str] | None = None,
+    preferences: dict[str, Any] | None = None,
+    notes: str | None = None,
+) -> None:
+    """Create or update a user's memory record. Only non-None fields are updated."""
+    existing = await get_user_memory(conn, user_id)
+    if existing is None:
+        await conn.execute(
+            """INSERT INTO user_memories (user_id, tracked_prs, focus_areas, preferences, notes)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                user_id,
+                json.dumps(tracked_prs or []),
+                json.dumps(focus_areas or []),
+                json.dumps(preferences or {}),
+                notes or "",
+            ),
+        )
+    else:
+        if tracked_prs is not None:
+            await conn.execute(
+                "UPDATE user_memories SET tracked_prs = ?, updated_at = datetime('now') WHERE user_id = ?",
+                (json.dumps(tracked_prs), user_id),
+            )
+        if focus_areas is not None:
+            await conn.execute(
+                "UPDATE user_memories SET focus_areas = ?, updated_at = datetime('now') WHERE user_id = ?",
+                (json.dumps(focus_areas), user_id),
+            )
+        if preferences is not None:
+            await conn.execute(
+                "UPDATE user_memories SET preferences = ?, updated_at = datetime('now') WHERE user_id = ?",
+                (json.dumps(preferences), user_id),
+            )
+        if notes is not None:
+            await conn.execute(
+                "UPDATE user_memories SET notes = ?, updated_at = datetime('now') WHERE user_id = ?",
+                (notes, user_id),
+            )
+    await conn.commit()
+
+
+async def add_tracked_pr(conn: aiosqlite.Connection, user_id: str, pr_number: int) -> list[int]:
+    """Add a PR to user's tracked list. Returns the updated list."""
+    mem = await get_user_memory(conn, user_id)
+    if mem:
+        current = json.loads(mem["tracked_prs"])
+    else:
+        current = []
+    if pr_number not in current:
+        current.append(pr_number)
+    await upsert_user_memory(conn, user_id, tracked_prs=current)
+    return current
+
+
+async def remove_tracked_pr(conn: aiosqlite.Connection, user_id: str, pr_number: int) -> list[int]:
+    """Remove a PR from user's tracked list. Returns the updated list."""
+    mem = await get_user_memory(conn, user_id)
+    if mem:
+        current = json.loads(mem["tracked_prs"])
+    else:
+        current = []
+    current = [p for p in current if p != pr_number]
+    await upsert_user_memory(conn, user_id, tracked_prs=current)
+    return current
+
+
+async def save_user_note(conn: aiosqlite.Connection, user_id: str, note: str) -> None:
+    """Append or replace the AI-written note for a user."""
+    await upsert_user_memory(conn, user_id, notes=note)
+
+
+# ---------------------------------------------------------------------------
+# PR classification cache (diffusion detection)
+# ---------------------------------------------------------------------------
+
+async def get_pr_classifications(conn: aiosqlite.Connection) -> dict[int, tuple[str, bool]]:
+    """Return {pr_number: (head_sha, is_diffusion)} for all cached entries."""
+    cur = await conn.execute("SELECT pr_number, head_sha, is_diffusion FROM pr_classification")
+    rows = await cur.fetchall()
+    return {row["pr_number"]: (row["head_sha"], bool(row["is_diffusion"])) for row in rows}
+
+
+async def upsert_pr_classification(
+    conn: aiosqlite.Connection, pr_number: int, head_sha: str, is_diffusion: bool
+) -> None:
+    """Insert or update the classification cache for a PR."""
+    await conn.execute(
+        "INSERT INTO pr_classification (pr_number, head_sha, is_diffusion) VALUES (?, ?, ?) "
+        "ON CONFLICT(pr_number) DO UPDATE SET head_sha = excluded.head_sha, is_diffusion = excluded.is_diffusion",
+        (pr_number, head_sha, int(is_diffusion)),
+    )
+    await conn.commit()

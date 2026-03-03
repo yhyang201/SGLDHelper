@@ -20,6 +20,26 @@ class SlackApp:
         self._settings = settings
         self.app = AsyncApp(token=settings.slack_bot_token)
         self._handler: AsyncSocketModeHandler | None = None
+        self.bot_user_id: str | None = None
+
+        # Debug middleware: log every incoming event
+        @self.app.middleware
+        async def log_all_events(body, next):
+            event = body.get("event", {})
+            event_type = event.get("type", body.get("type", "unknown"))
+            subtype = event.get("subtype", "")
+            channel = event.get("channel", "")
+            user = event.get("user", "")
+            text_preview = (event.get("text", "") or "")[:80]
+            log.debug(
+                "slack.event_received",
+                event_type=event_type,
+                subtype=subtype,
+                channel=channel,
+                user=user,
+                text_preview=text_preview,
+            )
+            await next()
 
     async def start(self) -> None:
         """Start the Socket Mode handler (non-blocking)."""
@@ -27,7 +47,13 @@ class SlackApp:
             self.app, self._settings.slack_app_token
         )
         await self._handler.connect_async()
-        log.info("slack.connected")
+        # Fetch bot's own user ID so we can filter out self-messages
+        try:
+            auth = await self.app.client.auth_test()
+            self.bot_user_id = auth.get("user_id")
+            log.info("slack.connected", bot_user_id=self.bot_user_id)
+        except Exception:
+            log.info("slack.connected")
 
     async def stop(self) -> None:
         """Disconnect the Socket Mode handler."""

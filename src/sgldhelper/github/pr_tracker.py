@@ -60,18 +60,47 @@ class PRTracker:
         )
 
     async def poll(self) -> list[PRChange]:
-        """Poll for PR changes and return detected events."""
+        """Poll for PR changes and return detected events.
+
+        Uses a classification cache to avoid calling ``get_pull_files`` for
+        every open PR on each poll cycle.  Only new PRs or PRs whose
+        ``head_sha`` changed since the last poll trigger a files lookup.
+        """
         changes: list[PRChange] = []
         pulls = await self._client.get_open_pulls()
+        cache = await queries.get_pr_classifications(self._db.conn)
 
         for pr_data in pulls:
-            # Always check file paths — label alone is not enough to
-            # distinguish multimodal_gen diffusion from diffusion-llm.
+            pr_num = pr_data["number"]
+            sha = pr_data["head"]["sha"]
+            cached = cache.get(pr_num)
+
+            if cached:
+                cached_sha, was_diffusion = cached
+                if cached_sha == sha:
+                    # Classification is still valid for this SHA.
+                    if not was_diffusion:
+                        continue  # known non-diffusion — skip
+                    # Known diffusion — proceed to upsert & change detection
+                    pr_record = self._normalize_pr(pr_data)
+                    old = await queries.upsert_pr(self._db.conn, pr_record)
+                    if old is None:
+                        changes.append(PRChange(event=PREvent.OPENED, pr=pr_record))
+                        log.info("pr.opened", pr=pr_record["pr_number"], title=pr_record["title"])
+                    else:
+                        detected = self._detect_changes(old, pr_record, pr_data)
+                        changes.extend(detected)
+                    continue
+
+            # New PR or SHA changed — fetch files and (re-)classify.
             try:
-                files = await self._client.get_pull_files(pr_data["number"])
+                files = await self._client.get_pull_files(pr_num)
             except Exception:
                 files = []
-            if not self.is_diffusion_pr(pr_data, files):
+            is_diff = self.is_diffusion_pr(pr_data, files)
+            await queries.upsert_pr_classification(self._db.conn, pr_num, sha, is_diff)
+
+            if not is_diff:
                 continue
 
             pr_record = self._normalize_pr(pr_data)

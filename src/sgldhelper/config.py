@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     # GitHub
-    github_token: str
+    github_token: str = ""
     github_repo: str = "sgl-project/sglang"
 
     # Slack
@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = "INFO"
+    log_dir: str = "logs"
 
     # AI / Kimi K2.5
     ai_enabled: bool = False
@@ -69,6 +70,10 @@ class Settings(BaseSettings):
             "multimodal-gen-test-2-gpu",
         ]
     )
+
+    @property
+    def github_configured(self) -> bool:
+        return bool(self.github_token)
 
     @property
     def github_owner(self) -> str:

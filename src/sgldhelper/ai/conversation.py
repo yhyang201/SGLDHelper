@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 from typing import Any
 
@@ -15,6 +16,8 @@ from sgldhelper.db.engine import Database
 
 log = structlog.get_logger()
 
+_current_user: contextvars.ContextVar[str] = contextvars.ContextVar("current_user")
+
 MAX_TOOL_ROUNDS = 10
 
 SYSTEM_PROMPT = (
@@ -25,7 +28,21 @@ SYSTEM_PROMPT = (
     "- When asked about PRs, CI, or features, use the available tools to fetch real data.\n"
     "- For write operations (like rerunning CI), always confirm with the user first.\n"
     "- If you don't have enough information, say so instead of guessing.\n"
-    "- Respond in the same language the user uses (Chinese or English).\n"
+    "- Respond in the same language the user uses (Chinese or English).\n\n"
+    "## PR-Feature Binding\n"
+    "When a user asks to track a PR (via update_tracked_prs), also call get_unlinked_features "
+    "to check for open feature items without a linked PR. If any feature looks related to the PR, "
+    "proactively ask the user whether they'd like to bind the PR to that feature item. "
+    "If the user confirms, call link_pr_to_feature to create the binding. "
+    "This ensures stall detection covers the PR.\n\n"
+    "## Code Review\n"
+    "When a user asks you to review a PR's code, call `review_pr_code` with the PR number "
+    "to fetch its diff. Then provide a structured review covering:\n"
+    "1. **Changes summary** — what the PR does at a high level\n"
+    "2. **Potential bugs** — logic errors, edge cases, off-by-one, null handling\n"
+    "3. **Code style** — naming, readability, consistency with the codebase\n"
+    "4. **Performance considerations** — unnecessary allocations, N+1 queries, hot paths\n"
+    "If the diff was truncated, mention that you only reviewed a partial diff.\n"
 )
 
 
@@ -64,8 +81,12 @@ class ConversationManager:
         # Load conversation history from DB
         messages = await self._build_messages(thread_ts, text, user_id)
 
-        # Run the function-calling loop
-        response_text = await self._run_tool_loop(messages, thread_ts, channel_id)
+        # Run the function-calling loop with user context
+        token = _current_user.set(user_id)
+        try:
+            response_text = await self._run_tool_loop(messages, thread_ts, channel_id)
+        finally:
+            _current_user.reset(token)
 
         return response_text
 
@@ -73,8 +94,30 @@ class ConversationManager:
         self, thread_ts: str, new_text: str, user_id: str
     ) -> list[dict[str, Any]]:
         """Build message list from system prompt + DB history + new user message."""
+        # Load user memory and inject into system prompt
+        system_content = SYSTEM_PROMPT
+        mem = await queries.get_user_memory(self._db.conn, user_id)
+        if mem:
+            parts: list[str] = []
+            tracked = json.loads(mem["tracked_prs"])
+            if tracked:
+                parts.append(f"- Tracking PRs: {', '.join(f'#{p}' for p in tracked)}")
+            focus = json.loads(mem["focus_areas"])
+            if focus:
+                parts.append(f"- Focus areas: {', '.join(focus)}")
+            if mem["notes"]:
+                parts.append(f"- Notes: {mem['notes']}")
+            prefs = json.loads(mem["preferences"])
+            if prefs:
+                parts.append(f"- Preferences: {json.dumps(prefs, ensure_ascii=False)}")
+            if parts:
+                user_section = "\n".join(parts)
+                system_content += (
+                    f"\n## About this user (Slack ID: {user_id}):\n{user_section}\n"
+                )
+
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
+            {"role": "system", "content": system_content}
         ]
 
         # Load prior conversation turns from DB
@@ -83,6 +126,8 @@ class ConversationManager:
             msg: dict[str, Any] = {"role": row["role"]}
             if row["content"]:
                 msg["content"] = row["content"]
+            if row.get("reasoning_content"):
+                msg["reasoning_content"] = row["reasoning_content"]
             if row["tool_calls"]:
                 msg["tool_calls"] = json.loads(row["tool_calls"])
             if row["tool_call_id"]:
@@ -122,7 +167,11 @@ class ConversationManager:
 
             if choice.finish_reason == "tool_calls" or message.tool_calls:
                 # Process tool calls
-                # Save assistant message with tool_calls
+                # Capture reasoning_content from thinking mode (Kimi K2.5 requires
+                # it to be replayed in subsequent requests)
+                rc = getattr(message, "reasoning_content", None)
+                reasoning_content = rc if isinstance(rc, str) else None
+
                 tool_calls_json = json.dumps([
                     {"id": tc.id, "type": tc.type,
                      "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
@@ -131,13 +180,17 @@ class ConversationManager:
                 await queries.save_conversation_message(
                     self._db.conn, thread_ts, channel_id,
                     role="assistant", content=message.content,
+                    reasoning_content=reasoning_content,
                     tool_calls=tool_calls_json,
                 )
 
-                # Add assistant message to context
+                # Add assistant message to context (include reasoning_content
+                # so the next API call won't reject the message)
                 assistant_msg: dict[str, Any] = {"role": "assistant"}
                 if message.content:
                     assistant_msg["content"] = message.content
+                if reasoning_content:
+                    assistant_msg["reasoning_content"] = reasoning_content
                 assistant_msg["tool_calls"] = [
                     {"id": tc.id, "type": tc.type,
                      "function": {"name": tc.function.name, "arguments": tc.function.arguments}}

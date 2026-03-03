@@ -304,7 +304,9 @@ def build_daily_digest(
 # AI-related messages
 # ---------------------------------------------------------------------------
 
-def build_stall_alert(alert: Any) -> dict[str, Any]:
+def build_stall_alert(
+    alert: Any, trackers: list[str] | None = None
+) -> dict[str, Any]:
     """Build a stall/nudge notification message."""
     from sgldhelper.ai.stall_detector import StallAlert
 
@@ -316,6 +318,10 @@ def build_stall_alert(alert: Any) -> dict[str, Any]:
         title = "Review Needed"
 
     pr_text = f" (PR #{alert.pr_number})" if alert.pr_number else ""
+    body = f"{emoji} *{title}*\n{alert.details}"
+    if trackers:
+        mentions = ", ".join(f"<@{uid}>" for uid in trackers)
+        body += f"\ncc {mentions}"
     return {
         "text": f"{title}: {alert.title}{pr_text}",
         "blocks": [
@@ -323,10 +329,7 @@ def build_stall_alert(alert: Any) -> dict[str, Any]:
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": (
-                        f"{emoji} *{title}*\n"
-                        f"{alert.details}"
-                    ),
+                    "text": body,
                 },
             },
         ],

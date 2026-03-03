@@ -57,7 +57,9 @@ class CIRerunner:
             )
 
         try:
-            await self._client.rerun_failed_jobs(result.run_id)
+            await self._client.create_issue_comment(
+                result.pr_number, "/rerun-failed-ci"
+            )
         except Exception as e:
             log.error("ci.rerun_failed", run_id=result.run_id, error=str(e))
             return RerunResult(
@@ -91,37 +93,44 @@ class CIRerunner:
         )
 
     async def manual_rerun(self, pr_number: int) -> list[RerunResult]:
-        """Manually rerun all failed CI runs for a PR."""
-        results: list[RerunResult] = []
+        """Manually rerun failed CI for a PR by commenting /rerun-failed-ci."""
         ci_runs = await queries.get_ci_runs_for_pr(self._db.conn, pr_number)
 
-        for run in ci_runs:
-            if run["conclusion"] != "failure":
-                continue
-            try:
-                await self._client.rerun_failed_jobs(run["run_id"])
-                await queries.log_rerun(
-                    self._db.conn,
-                    run_id=run["run_id"],
-                    new_run_id=None,
-                    triggered_by="manual",
-                    reason="Manual rerun via Slack",
-                )
-                results.append(RerunResult(
-                    run_id=run["run_id"],
-                    pr_number=pr_number,
-                    triggered=True,
-                    reason="Manual rerun triggered",
-                    triggered_by="manual",
-                ))
-                log.info("ci.manual_rerun", run_id=run["run_id"], pr=pr_number)
-            except Exception as e:
-                results.append(RerunResult(
-                    run_id=run["run_id"],
+        failed_runs = [r for r in ci_runs if r["conclusion"] == "failure"]
+        if not failed_runs:
+            return []
+
+        # One comment triggers all failed jobs — no need to comment per run.
+        try:
+            await self._client.create_issue_comment(pr_number, "/rerun-failed-ci")
+        except Exception as e:
+            return [
+                RerunResult(
+                    run_id=r["run_id"],
                     pr_number=pr_number,
                     triggered=False,
                     reason=f"Failed: {e}",
                     triggered_by="manual",
-                ))
+                )
+                for r in failed_runs
+            ]
+
+        results: list[RerunResult] = []
+        for run in failed_runs:
+            await queries.log_rerun(
+                self._db.conn,
+                run_id=run["run_id"],
+                new_run_id=None,
+                triggered_by="manual",
+                reason="Manual rerun via Slack",
+            )
+            results.append(RerunResult(
+                run_id=run["run_id"],
+                pr_number=pr_number,
+                triggered=True,
+                reason="Manual rerun triggered",
+                triggered_by="manual",
+            ))
+            log.info("ci.manual_rerun", run_id=run["run_id"], pr=pr_number)
 
         return results

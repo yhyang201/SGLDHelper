@@ -57,17 +57,18 @@ CREATE TABLE IF NOT EXISTS poll_state (
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_ts   TEXT NOT NULL,
-    channel_id  TEXT NOT NULL,
-    role        TEXT NOT NULL,
-    content     TEXT,
-    tool_calls  TEXT,
-    tool_call_id TEXT,
-    name        TEXT,
-    tokens_in   INTEGER NOT NULL DEFAULT 0,
-    tokens_out  INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_ts           TEXT NOT NULL,
+    channel_id          TEXT NOT NULL,
+    role                TEXT NOT NULL,
+    content             TEXT,
+    reasoning_content   TEXT,
+    tool_calls          TEXT,
+    tool_call_id        TEXT,
+    name                TEXT,
+    tokens_in           INTEGER NOT NULL DEFAULT 0,
+    tokens_out          INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_thread ON conversations(thread_ts);
 
@@ -99,5 +100,20 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     tokens_in   INTEGER NOT NULL DEFAULT 0,
     tokens_out  INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS user_memories (
+    user_id         TEXT PRIMARY KEY,
+    tracked_prs     TEXT NOT NULL DEFAULT '[]',
+    focus_areas     TEXT NOT NULL DEFAULT '[]',
+    preferences     TEXT NOT NULL DEFAULT '{}',
+    notes           TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS pr_classification (
+    pr_number    INTEGER PRIMARY KEY,
+    head_sha     TEXT NOT NULL,
+    is_diffusion INTEGER NOT NULL
 );
 """

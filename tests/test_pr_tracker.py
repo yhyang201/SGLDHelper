@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from sgldhelper.db import queries
 from sgldhelper.github.pr_tracker import PREvent, PRTracker
 from tests.conftest import load_fixture
 
@@ -119,3 +120,78 @@ class TestPoll:
 
         changes = await tracker.poll()
         assert len(changes) == 0
+
+
+class TestClassificationCache:
+    """Tests for the pr_classification cache used by poll()."""
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_skips_get_pull_files(self, tracker, pr_list, db):
+        """Second poll should NOT call get_pull_files for unchanged PRs."""
+        diffusion_files = load_fixture("pr_files_diffusion.json")
+        tracker._client.get_open_pulls = AsyncMock(return_value=pr_list)
+        tracker._client.get_pull_files = AsyncMock(
+            side_effect=lambda n: diffusion_files if n in (1234, 1236) else []
+        )
+        tracker._client.get_pull = AsyncMock(side_effect=Exception("not found"))
+
+        # First poll — cold cache, must call get_pull_files for every PR.
+        await tracker.poll()
+        assert tracker._client.get_pull_files.call_count == len(pr_list)
+
+        # Reset mock counts.
+        tracker._client.get_pull_files.reset_mock()
+
+        # Second poll — same SHAs, cache should prevent any get_pull_files calls.
+        await tracker.poll()
+        assert tracker._client.get_pull_files.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_sha_change_triggers_reclassification(self, tracker, pr_list, db):
+        """When a PR's head_sha changes, poll() must re-fetch files."""
+        diffusion_files = load_fixture("pr_files_diffusion.json")
+        tracker._client.get_open_pulls = AsyncMock(return_value=pr_list)
+        tracker._client.get_pull_files = AsyncMock(
+            side_effect=lambda n: diffusion_files if n in (1234, 1236) else []
+        )
+        tracker._client.get_pull = AsyncMock(side_effect=Exception("not found"))
+
+        # First poll — populates cache.
+        await tracker.poll()
+        tracker._client.get_pull_files.reset_mock()
+
+        # Simulate SHA change on PR #1234.
+        updated_pr_list = [pr.copy() for pr in pr_list]
+        updated_pr_list[0] = {**pr_list[0], "head": {"sha": "newsha999999"}}
+        tracker._client.get_open_pulls = AsyncMock(return_value=updated_pr_list)
+
+        await tracker.poll()
+        # Only PR #1234 should trigger get_pull_files (SHA changed).
+        called_prs = [call.args[0] for call in tracker._client.get_pull_files.call_args_list]
+        assert 1234 in called_prs
+        assert 1235 not in called_prs
+        assert 1236 not in called_prs
+
+    @pytest.mark.asyncio
+    async def test_new_pr_triggers_classification(self, tracker, pr_list, db):
+        """A PR not in the cache must trigger get_pull_files."""
+        diffusion_files = load_fixture("pr_files_diffusion.json")
+        # Start with only first two PRs.
+        initial_prs = pr_list[:2]
+        tracker._client.get_open_pulls = AsyncMock(return_value=initial_prs)
+        tracker._client.get_pull_files = AsyncMock(
+            side_effect=lambda n: diffusion_files if n in (1234, 1236) else []
+        )
+        tracker._client.get_pull = AsyncMock(side_effect=Exception("not found"))
+
+        await tracker.poll()
+        tracker._client.get_pull_files.reset_mock()
+
+        # Now a third PR appears.
+        tracker._client.get_open_pulls = AsyncMock(return_value=pr_list)
+        await tracker.poll()
+        # Only the new PR #1236 should need get_pull_files.
+        called_prs = [call.args[0] for call in tracker._client.get_pull_files.call_args_list]
+        assert 1236 in called_prs
+        assert 1234 not in called_prs
+        assert 1235 not in called_prs
