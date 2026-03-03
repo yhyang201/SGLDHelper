@@ -1,0 +1,11 @@
+{
+  "workflow_runs": [
+    {
+      "id": 9001,
+      "name": "PR Tests",
+      "head_sha": "abc123def456",
+      "status": "completed",
+      "conclusion": "failure"
+    }
+  ]
+}

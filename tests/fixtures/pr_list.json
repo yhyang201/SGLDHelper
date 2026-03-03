@@ -1,0 +1,38 @@
+[
+  {
+    "number": 1234,
+    "title": "Add Wan2.1 video generation support",
+    "state": "open",
+    "user": {"login": "mickqian"},
+    "head": {"sha": "abc123def456"},
+    "updated_at": "2025-03-01T10:00:00Z",
+    "changed_files": 12,
+    "labels": [{"name": "diffusion"}, {"name": "enhancement"}],
+    "merged": false,
+    "merged_at": null
+  },
+  {
+    "number": 1235,
+    "title": "Fix unrelated bug in router",
+    "state": "open",
+    "user": {"login": "otherdev"},
+    "head": {"sha": "999aaa888bbb"},
+    "updated_at": "2025-03-01T09:00:00Z",
+    "changed_files": 2,
+    "labels": [{"name": "bug"}],
+    "merged": false,
+    "merged_at": null
+  },
+  {
+    "number": 1236,
+    "title": "Hunyuan model improvements",
+    "state": "open",
+    "user": {"login": "contributor1"},
+    "head": {"sha": "deadbeef1234"},
+    "updated_at": "2025-03-01T11:00:00Z",
+    "changed_files": 5,
+    "labels": [],
+    "merged": false,
+    "merged_at": null
+  }
+]

@@ -1,0 +1,25 @@
+{
+  "jobs": [
+    {
+      "id": 50001,
+      "name": "multimodal-gen-test-1-gpu",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/sgl-project/sglang/actions/runs/9001/jobs/50001"
+    },
+    {
+      "id": 50002,
+      "name": "multimodal-gen-test-2-gpu",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/sgl-project/sglang/actions/runs/9001/jobs/50002"
+    },
+    {
+      "id": 50003,
+      "name": "unit-test",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/sgl-project/sglang/actions/runs/9001/jobs/50003"
+    }
+  ]
+}
