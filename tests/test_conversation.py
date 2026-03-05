@@ -472,12 +472,71 @@ class TestUserMemoryQueries:
         assert mem is None
 
 
-class TestSystemPrompt:
-    def test_system_prompt_contains_pr_feature_binding(self):
-        assert "PR-Feature Binding" in SYSTEM_PROMPT
-        assert "get_unlinked_features" in SYSTEM_PROMPT
-        assert "link_pr_to_feature" in SYSTEM_PROMPT
+class TestSanitiseToolCalls:
+    def test_orphaned_tool_calls_get_patched(self):
+        """Assistant message with tool_calls but no tool responses should be patched."""
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "trigger CI for 3 PRs"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "tc_0", "type": "function", "function": {"name": "trigger_ci", "arguments": '{"pr_number":100}'}},
+                    {"id": "tc_1", "type": "function", "function": {"name": "trigger_ci", "arguments": '{"pr_number":200}'}},
+                    {"id": "tc_2", "type": "function", "function": {"name": "trigger_ci", "arguments": '{"pr_number":300}'}},
+                ],
+            },
+        ]
 
+        patched = ConversationManager._sanitise_tool_calls(messages)
+
+        # Should have 3 original messages + 3 synthetic tool responses
+        assert len(patched) == 6
+        tool_msgs = [m for m in patched if m.get("role") == "tool"]
+        assert len(tool_msgs) == 3
+        assert {m["tool_call_id"] for m in tool_msgs} == {"tc_0", "tc_1", "tc_2"}
+
+    def test_complete_history_unchanged(self):
+        """Messages with proper tool responses should not be modified."""
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "do something"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "tc_0", "type": "function", "function": {"name": "get_open_prs", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_0", "content": "[]"},
+            {"role": "assistant", "content": "Done!"},
+        ]
+
+        patched = ConversationManager._sanitise_tool_calls(messages)
+        assert len(patched) == 5  # unchanged
+
+    def test_partial_orphan_only_missing_patched(self):
+        """Only missing tool responses should be added, existing ones kept."""
+        messages = [
+            {"role": "user", "content": "do 2 things"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "tc_a", "type": "function", "function": {"name": "foo", "arguments": "{}"}},
+                    {"id": "tc_b", "type": "function", "function": {"name": "bar", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_a", "content": "ok"},
+            # tc_b is missing
+        ]
+
+        patched = ConversationManager._sanitise_tool_calls(messages)
+        tool_msgs = [m for m in patched if m.get("role") == "tool"]
+        assert len(tool_msgs) == 2
+        ids = {m["tool_call_id"] for m in tool_msgs}
+        assert ids == {"tc_a", "tc_b"}
+
+
+class TestSystemPrompt:
     def test_system_prompt_contains_code_review(self):
         assert "Code Review" in SYSTEM_PROMPT
         assert "review_pr_code" in SYSTEM_PROMPT

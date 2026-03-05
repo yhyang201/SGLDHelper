@@ -13,12 +13,10 @@ class ChannelRouter:
 
     pr_channel: str
     ci_channel: str
-    features_channel: str
 
     @classmethod
     def from_settings(cls, settings: Settings) -> ChannelRouter:
         return cls(
             pr_channel=settings.slack_pr_channel,
             ci_channel=settings.slack_ci_channel,
-            features_channel=settings.slack_features_channel,
         )

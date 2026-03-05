@@ -14,13 +14,39 @@ from sgldhelper.db.engine import Database
 
 log = structlog.get_logger()
 
+_SLACK_FORMAT_RULES = (
+    "IMPORTANT — you are outputting to Slack mrkdwn, NOT standard Markdown:\n"
+    "- Bold: *text* (single asterisk, NOT double **)\n"
+    "- Italic: _text_\n"
+    "- Inline code: `code`\n"
+    "- Code block: ```code```\n"
+    "- Bullet list: use • or - at line start\n"
+    "- Links: <https://url|display text> (NOT [text](url))\n"
+    "- DO NOT use Markdown tables (| col |) — Slack cannot render them\n"
+    "- DO NOT use Markdown headings (# ##) — use *bold text* on its own line\n"
+)
+
+DIFFUSION_SUMMARY_SYSTEM_PROMPT = (
+    "You are a summary generator for the SGLang Diffusion (multimodal_gen) team. "
+    "Given recent PR activity data, generate a concise status update.\n\n"
+    f"{_SLACK_FORMAT_RULES}\n"
+    "Other rules:\n"
+    "- Each PR has a status tag: [NEW] = newly opened, [MERGED] = merged, [CLOSED] = closed\n"
+    "- You MUST preserve each PR's status tag clearly in the output "
+    "(e.g. use emoji: :new: for NEW, :merged: for MERGED, :no_entry_sign: for CLOSED)\n"
+    "- Group by status: New PRs, Merged, Closed\n"
+    "- Keep it under 300 words\n"
+    "- Add a brief one-line comment for each PR explaining its significance\n"
+    "- Respond in the same language as the data (English or Chinese)\n"
+)
+
 STANDUP_SYSTEM_PROMPT = (
     "You are a standup summary generator for the SGLang Diffusion team. "
-    "Given recent activity data (PRs, CI runs, feature items, blockers), "
+    "Given recent activity data (PRs, blockers), "
     "generate a concise daily standup summary.\n\n"
-    "Format:\n"
-    "- Use Slack mrkdwn formatting (bold with *, code with `)\n"
-    "- Group by: PRs, CI, Features, Blockers\n"
+    f"{_SLACK_FORMAT_RULES}\n"
+    "Other rules:\n"
+    "- Group by: PRs, Blockers\n"
     "- Keep it under 500 words\n"
     "- Highlight items needing attention\n"
     "- Respond in the same language as the data (English or Chinese)\n"
@@ -58,28 +84,6 @@ class SummaryGenerator:
                 )
             context_parts.append(f"**Recent PRs ({len(prs)}):**\n" + "\n".join(pr_lines))
 
-        ci_runs = activity.get("ci_runs", [])
-        if ci_runs:
-            failures = [r for r in ci_runs if r.get("conclusion") == "failure"]
-            successes = [r for r in ci_runs if r.get("conclusion") == "success"]
-            context_parts.append(
-                f"**CI Runs:** {len(ci_runs)} total, "
-                f"{len(failures)} failures, {len(successes)} successes"
-            )
-            if failures:
-                fail_lines = []
-                for r in failures[:5]:
-                    fail_lines.append(
-                        f"- Run {r['run_id']} for PR #{r['pr_number']}: "
-                        f"{r.get('failure_category', 'unknown')} - "
-                        f"{(r.get('failure_summary') or '')[:100]}"
-                    )
-                context_parts.append("**CI Failures:**\n" + "\n".join(fail_lines))
-
-        open_features = activity.get("open_features", [])
-        if open_features:
-            context_parts.append(f"**Open Feature Items:** {len(open_features)}")
-
         if blockers:
             blocker_lines = []
             for b in blockers:
@@ -109,3 +113,52 @@ class SummaryGenerator:
         )
 
         return response.choices[0].message.content or "Unable to generate summary."
+
+    async def generate_diffusion_summary(self, since_hours: int = 2) -> str | None:
+        """Generate a periodic diffusion PR summary. Returns None if no activity."""
+        data = await queries.get_diffusion_pr_summary(self._db.conn, since_hours)
+
+        opened = data.get("opened", [])
+        merged = data.get("merged", [])
+        closed = data.get("closed", [])
+
+        if not opened and not merged and not closed:
+            return None  # no activity — silently skip
+
+        # Tag each PR with its status change so the LLM preserves it
+        pr_lines: list[str] = []
+        for pr in opened[:10]:
+            pr_lines.append(
+                f"- [NEW] PR #{pr['pr_number']}: {pr['title']} (by {pr['author']})"
+            )
+        for pr in merged[:10]:
+            pr_lines.append(
+                f"- [MERGED] PR #{pr['pr_number']}: {pr['title']} (by {pr['author']})"
+            )
+        for pr in closed[:10]:
+            pr_lines.append(
+                f"- [CLOSED] PR #{pr['pr_number']}: {pr['title']} (by {pr['author']})"
+            )
+
+        context = "\n".join(pr_lines)
+
+        messages = [
+            {"role": "system", "content": DIFFUSION_SUMMARY_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Generate a diffusion PR status update from the last {since_hours} hours:\n\n"
+                    f"{context}"
+                ),
+            },
+        ]
+
+        response = await self._client.chat(messages, thinking=False)
+        tokens_in, tokens_out = self._client.extract_usage(response)
+
+        await queries.log_llm_usage(
+            self._db.conn, "diffusion_summary", self._settings.kimi_model,
+            tokens_in, tokens_out,
+        )
+
+        return response.choices[0].message.content or None

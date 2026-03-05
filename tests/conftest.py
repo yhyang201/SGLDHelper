@@ -28,7 +28,7 @@ def settings(tmp_path):
         slack_app_token="xapp-test",
         slack_pr_channel="C_TEST_PR",
         slack_ci_channel="C_TEST_CI",
-        slack_features_channel="C_TEST_FEAT",
+        moonshot_api_key="sk-test",
         db_path=str(tmp_path / "test.db"),
     )
 

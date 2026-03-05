@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 
+from sgldhelper.ci.monitor import CIJobResult, CIStatus
 from sgldhelper.config import Settings
 from sgldhelper.db.engine import Database
-from sgldhelper.db import queries
-from sgldhelper.github.ci_analyzer import CIResult
-from sgldhelper.github.ci_rerunner import RerunResult
 from sgldhelper.slack.app import SlackApp
 from sgldhelper.slack.channels import ChannelRouter
 from sgldhelper.slack import messages
@@ -17,66 +17,94 @@ log = structlog.get_logger()
 
 
 class CIEventHandler:
-    """Send Slack notifications for CI events."""
+    """Send Slack notifications for CI events on tracked PRs."""
 
     def __init__(
         self,
         slack_app: SlackApp,
         channels: ChannelRouter,
         settings: Settings,
+        db: Database,
     ) -> None:
         self._slack = slack_app
         self._channels = channels
         self._settings = settings
+        self._db = db
 
-    async def handle_failure(self, result: CIResult, db: Database) -> None:
-        """Notify about a CI failure."""
-        msg = messages.build_ci_failure(result, self._settings.github_repo)
-
-        # Try to thread under the PR's main message
-        stored = await queries.get_pr(db.conn, result.pr_number)
-        thread_ts = stored.get("slack_thread_ts") if stored else None
-
-        await self._slack.post_message(
+    async def _post(self, msg: dict[str, Any]) -> None:
+        """Post a message and save to conversation history for thread context."""
+        await self._slack.post_message_with_context(
             self._channels.ci_channel,
             text=msg["text"],
             blocks=msg.get("blocks"),
-            thread_ts=thread_ts,
+            db_conn=self._db.conn,
         )
-        log.info("notification.ci_failure", pr=result.pr_number, run=result.run_id)
 
-    async def handle_success(self, pr_number: int, db: Database) -> None:
-        """Notify about CI passing."""
-        msg = messages.build_ci_success(pr_number, self._settings.github_repo)
-
-        stored = await queries.get_pr(db.conn, pr_number)
-        thread_ts = stored.get("slack_thread_ts") if stored else None
-
-        await self._slack.post_message(
-            self._channels.ci_channel,
-            text=msg["text"],
-            blocks=msg.get("blocks"),
-            thread_ts=thread_ts,
-        )
-        log.info("notification.ci_success", pr=pr_number)
-
-    async def handle_rerun(
-        self, result: CIResult, rerun: RerunResult, db: Database
+    async def notify_ci_passed(
+        self,
+        pr_number: int,
+        user_ids: list[str],
+        ci_status: CIStatus,
+        review_state: str,
     ) -> None:
-        """Notify about a CI rerun (auto or manual)."""
-        msg = messages.build_ci_rerun(
-            result,
-            auto=(rerun.triggered_by == "auto"),
-            repo=self._settings.github_repo,
-        )
+        msg = messages.build_ci_passed(pr_number, ci_status, user_ids, self._settings.github_repo)
+        await self._post(msg)
+        log.info("notification.ci_passed", pr=pr_number)
 
-        stored = await queries.get_pr(db.conn, result.pr_number)
-        thread_ts = stored.get("slack_thread_ts") if stored else None
-
-        await self._slack.post_message(
-            self._channels.ci_channel,
-            text=msg["text"],
-            blocks=msg.get("blocks"),
-            thread_ts=thread_ts,
+    async def notify_ci_failed_retrying(
+        self,
+        pr_number: int,
+        user_ids: list[str],
+        retryable_jobs: list[CIJobResult],
+    ) -> None:
+        msg = messages.build_ci_failed_retrying(
+            pr_number, retryable_jobs, user_ids, self._settings.github_repo,
         )
-        log.info("notification.ci_rerun", pr=result.pr_number, auto=rerun.triggered_by == "auto")
+        await self._post(msg)
+        log.info("notification.ci_failed_retrying", pr=pr_number, jobs=len(retryable_jobs))
+
+    async def notify_ci_failed_permanent(
+        self,
+        pr_number: int,
+        user_ids: list[str],
+        permanent_jobs: list[CIJobResult],
+    ) -> None:
+        msg = messages.build_ci_failed_permanent(
+            pr_number, permanent_jobs, user_ids, self._settings.github_repo,
+        )
+        await self._post(msg)
+        log.info("notification.ci_failed_permanent", pr=pr_number, jobs=len(permanent_jobs))
+
+    async def notify_pr_untracked(
+        self,
+        pr_number: int,
+        user_ids: list[str],
+        reason: str,
+    ) -> None:
+        msg = messages.build_pr_untracked(
+            pr_number, user_ids, reason, self._settings.github_repo,
+        )
+        await self._post(msg)
+        log.info("notification.pr_untracked", pr=pr_number, reason=reason)
+
+    async def notify_merge_countdown(
+        self, pr_number: int, user_ids: list[str], delay_seconds: int
+    ) -> None:
+        msg = messages.build_merge_countdown(
+            pr_number, user_ids, delay_seconds, self._settings.github_repo,
+        )
+        await self._post(msg)
+
+    async def notify_merge_complete(self, pr_number: int, user_ids: list[str]) -> None:
+        msg = messages.build_merge_complete(pr_number, user_ids, self._settings.github_repo)
+        await self._post(msg)
+
+    async def notify_merge_cancelled(self, pr_number: int, user_ids: list[str]) -> None:
+        msg = messages.build_merge_cancelled(pr_number, user_ids, self._settings.github_repo)
+        await self._post(msg)
+
+    async def notify_tracked_pr_summary(
+        self, pr_number: int, user_ids: list[str], summary: str
+    ) -> None:
+        msg = messages.build_tracked_pr_summary(pr_number, user_ids, summary, self._settings.github_repo)
+        await self._post(msg)

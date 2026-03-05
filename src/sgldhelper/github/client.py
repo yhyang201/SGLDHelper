@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import combinations as _combinations
 from typing import Any
 
 import httpx
@@ -145,12 +146,42 @@ class GitHubClient:
             return None
         return resp.json()
 
+    async def put(
+        self,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+    ) -> Any:
+        """PUT request."""
+        self._require_token()
+        await self._limiter.acquire()
+        url = self._repo_url(path)
+        resp = await self._client.put(url, json=json)
+        resp.raise_for_status()
+        if resp.status_code == 204:
+            return None
+        return resp.json()
+
     # ---- Convenience methods ----
 
     async def get_open_pulls(self) -> list[dict[str, Any]]:
         return await self.get_paginated(
             "pulls",
             params={"state": "open", "sort": "updated", "direction": "desc"},
+        )
+
+    async def get_open_pulls_all(self, max_prs: int = 500) -> list[dict[str, Any]]:
+        """Fetch up to *max_prs* open PRs. Used for cold start seeding."""
+        max_pages = max(1, max_prs // 100)
+        return await self.get_paginated(
+            "pulls",
+            params={
+                "state": "open",
+                "sort": "updated",
+                "direction": "desc",
+                "per_page": 100,
+            },
+            max_pages=max_pages,
         )
 
     async def get_pull(self, pr_number: int) -> dict[str, Any]:
@@ -217,3 +248,86 @@ class GitHubClient:
         return await self.post(
             f"issues/{issue_number}/comments", json={"body": body}
         )
+
+    async def merge_pull(
+        self, pr_number: int, merge_method: str = "squash"
+    ) -> dict[str, Any]:
+        """Merge a pull request via squash (default) or merge/rebase."""
+        return await self.put(
+            f"pulls/{pr_number}/merge",
+            json={"merge_method": merge_method},
+        )
+
+    async def get_pull_commits(
+        self, pr_number: int
+    ) -> list[dict[str, Any]]:
+        """Get the list of commits on a pull request."""
+        return await self.get_paginated(f"pulls/{pr_number}/commits")
+
+    async def search_issues(
+        self,
+        keywords: list[str],
+        *,
+        is_pr: bool = True,
+        state: str | None = None,
+        max_results: int = 10,
+        min_results: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Search issues/PRs via the GitHub Search API with fallback.
+
+        Strategy: search all keywords (AND). If fewer than *min_results*
+        are found and there are 2+ keywords, progressively drop one keyword
+        at a time (from the end) and merge results until we have enough.
+        """
+        # Build the fixed qualifiers that are always appended
+        qualifiers: list[str] = []
+        qualifiers.append(f"repo:{self._owner}/{self._repo}")
+        if is_pr:
+            qualifiers.append("type:pr")
+        if state:
+            qualifiers.append(f"state:{state}")
+
+        # --- First try: all keywords ---
+        items = await self._search_once(keywords, qualifiers, max_results)
+
+        if len(items) >= min_results or len(keywords) <= 1:
+            return items[:max_results]
+
+        # --- Fallback: progressively drop keywords ---
+        seen_ids: set[int] = {item["id"] for item in items}
+        merged = list(items)
+
+        # Try subsets: drop one keyword at a time, then two, etc.
+        for drop_count in range(1, len(keywords)):
+            if len(merged) >= min_results:
+                break
+            subset_len = len(keywords) - drop_count
+            for combo in _combinations(keywords, subset_len):
+                if len(merged) >= min_results:
+                    break
+                extra = await self._search_once(
+                    list(combo), qualifiers, max_results - len(merged),
+                )
+                for item in extra:
+                    if item["id"] not in seen_ids:
+                        seen_ids.add(item["id"])
+                        merged.append(item)
+
+        return merged[:max_results]
+
+    async def _search_once(
+        self,
+        keywords: list[str],
+        qualifiers: list[str],
+        per_page: int,
+    ) -> list[dict[str, Any]]:
+        """Execute a single GitHub search request."""
+        await self._limiter.acquire()
+        q = " ".join(keywords + qualifiers)
+        resp = await self._client.get(
+            "/search/issues",
+            params={"q": q, "per_page": per_page, "sort": "updated", "order": "desc"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("items", [])

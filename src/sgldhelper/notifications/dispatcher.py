@@ -5,9 +5,9 @@ from __future__ import annotations
 import structlog
 
 from sgldhelper.config import Settings
-from sgldhelper.notifications.ci_events import CIEventHandler
-from sgldhelper.notifications.feature_events import FeatureEventHandler
+from sgldhelper.db.engine import Database
 from sgldhelper.notifications.pr_events import PREventHandler
+from sgldhelper.notifications.ci_events import CIEventHandler
 from sgldhelper.slack.app import SlackApp
 from sgldhelper.slack.channels import ChannelRouter
 
@@ -22,7 +22,7 @@ class NotificationDispatcher:
         slack_app: SlackApp,
         channels: ChannelRouter,
         settings: Settings,
+        db: Database,
     ) -> None:
         self.pr = PREventHandler(slack_app, channels, settings)
-        self.ci = CIEventHandler(slack_app, channels, settings)
-        self.feature = FeatureEventHandler(slack_app, channels, settings)
+        self.ci = CIEventHandler(slack_app, channels, settings, db)

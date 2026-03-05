@@ -22,27 +22,53 @@ MAX_TOOL_ROUNDS = 10
 
 SYSTEM_PROMPT = (
     "You are SGLDHelper, an AI assistant for the SGLang Diffusion team. "
-    "You help the team track PRs, CI status, feature progress, and project health.\n\n"
+    "You help the team track PRs, feature progress, and project health.\n\n"
     "Guidelines:\n"
-    "- Be concise and direct. Use Slack-friendly formatting (bold, code blocks).\n"
-    "- When asked about PRs, CI, or features, use the available tools to fetch real data.\n"
-    "- For write operations (like rerunning CI), always confirm with the user first.\n"
+    "- Be concise and direct.\n"
+    "- When asked about PRs or features, use the available tools to fetch real data.\n"
     "- If you don't have enough information, say so instead of guessing.\n"
     "- Respond in the same language the user uses (Chinese or English).\n\n"
-    "## PR-Feature Binding\n"
-    "When a user asks to track a PR (via update_tracked_prs), also call get_unlinked_features "
-    "to check for open feature items without a linked PR. If any feature looks related to the PR, "
-    "proactively ask the user whether they'd like to bind the PR to that feature item. "
-    "If the user confirms, call link_pr_to_feature to create the binding. "
-    "This ensures stall detection covers the PR.\n\n"
+    "## Slack mrkdwn formatting (MUST follow)\n"
+    "You are outputting to Slack, NOT standard Markdown. The rules are different:\n"
+    "- Bold: *text* (single asterisk, NOT double **)\n"
+    "- Italic: _text_ (underscore)\n"
+    "- Strikethrough: ~text~\n"
+    "- Inline code: `code`\n"
+    "- Code block: ```code```\n"
+    "- Bullet list: use • or - at line start\n"
+    "- Links: <https://url|display text> (angle brackets, NOT [text](url))\n"
+    "- DO NOT use Markdown tables (| col | col |) — Slack does not render them. "
+    "Use bullet lists or plain text instead.\n"
+    "- DO NOT use Markdown headings (# ## ###) — use *bold text* on its own line instead.\n"
+    "- Emoji: :emoji_name: (e.g. :white_check_mark:, :fire:, :warning:)\n\n"
     "## Code Review\n"
     "When a user asks you to review a PR's code, call `review_pr_code` with the PR number "
     "to fetch its diff. Then provide a structured review covering:\n"
-    "1. **Changes summary** — what the PR does at a high level\n"
-    "2. **Potential bugs** — logic errors, edge cases, off-by-one, null handling\n"
-    "3. **Code style** — naming, readability, consistency with the codebase\n"
-    "4. **Performance considerations** — unnecessary allocations, N+1 queries, hot paths\n"
-    "If the diff was truncated, mention that you only reviewed a partial diff.\n"
+    "1. *Changes summary* — what the PR does at a high level\n"
+    "2. *Potential bugs* — logic errors, edge cases, off-by-one, null handling\n"
+    "3. *Code style* — naming, readability, consistency with the codebase\n"
+    "4. *Performance considerations* — unnecessary allocations, N+1 queries, hot paths\n"
+    "If the diff was truncated, mention that you only reviewed a partial diff.\n\n"
+    "## PR Tracking\n"
+    "When a user asks to track a PR:\n"
+    "1. Call `update_tracked_prs` to add it\n"
+    "2. Call `get_pr_details` to show the PR overview\n"
+    "3. Call `get_ci_status` to show CI status\n"
+    "4. Call `get_pr_reviews` to check review state\n"
+    "5. If there's no `run-ci` label, proactively ask the user if they want to trigger CI.\n\n"
+    "## CI Management\n"
+    "- Use `get_ci_status` to check CI (Nvidia + AMD workflows)\n"
+    "- Use `trigger_ci` (requires confirmation) to trigger CI via comment\n"
+    "- Use `cancel_auto_merge` (requires confirmation) to cancel pending auto-merges\n"
+    "- CI has two workflows: Nvidia (GPU tests) and AMD (GPU tests), controlled by `run-ci` label\n\n"
+    "## Merge\n"
+    "- Use `merge_pr` (requires confirmation) to merge a PR when a user asks to merge.\n"
+    "- Default merge method is squash. Before merging, check CI and review status first.\n"
+    "- When the user says 'merge吧', 'merge it', '合并' etc., treat it as an explicit merge request.\n"
+    "- Do NOT tell the user to go to GitHub to merge manually — you have the ability to merge directly.\n"
+    "- When the user asks to 'merge可以merge的PR' or 'merge all ready PRs', "
+    "call `get_merge_ready_prs` first (one tool call), then merge each one. "
+    "Do NOT loop through PRs individually with get_ci_status + get_pr_reviews — that is too slow.\n"
 )
 
 
@@ -62,6 +88,44 @@ class ConversationManager:
         self._settings = settings
         # Pending confirmations: {thread_ts: {tool_name, arguments}}
         self._pending_confirmations: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _sanitise_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Patch up history so every tool_call id has a matching tool response.
+
+        If an assistant message contains tool_calls whose ids never appear in a
+        subsequent ``role=tool`` message, we inject a synthetic tool response so
+        the API doesn't reject the request.  This handles cases like:
+        - Bot crashed mid-tool-execution
+        - Confirmation timed out / was never answered
+        - Old bug where batch tool_calls were partially handled
+        """
+        # Collect all tool response ids present in the conversation
+        responded_ids: set[str] = set()
+        for msg in messages:
+            if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                responded_ids.add(msg["tool_call_id"])
+
+        # Walk through and patch orphaned tool_calls
+        patched: list[dict[str, Any]] = []
+        for msg in messages:
+            patched.append(msg)
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id", "")
+                    if tc_id and tc_id not in responded_ids:
+                        fn_name = tc.get("function", {}).get("name", "unknown")
+                        patched.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "name": fn_name,
+                            "content": json.dumps({
+                                "error": "Tool execution was interrupted. "
+                                "Please retry if needed."
+                            }),
+                        })
+                        responded_ids.add(tc_id)
+        return patched
 
     async def handle_mention(
         self,
@@ -136,6 +200,11 @@ class ConversationManager:
                 msg["name"] = row["name"]
             messages.append(msg)
 
+        # Sanitise: ensure every assistant tool_call has a matching tool response.
+        # Orphaned tool_calls (e.g. from a crash or confirmation timeout) would
+        # cause the API to reject the request with a 400 error.
+        messages = self._sanitise_tool_calls(messages)
+
         # Add new user message
         messages.append({"role": "user", "content": new_text})
 
@@ -198,54 +267,65 @@ class ConversationManager:
                 ]
                 messages.append(assistant_msg)
 
-                # Execute each tool call
+                # Separate tool calls into auto-execute and confirmation-needed
+                auto_calls = []
+                confirm_calls = []
                 for tc in message.tool_calls:
+                    if self._tools.needs_confirmation(tc.function.name):
+                        confirm_calls.append(tc)
+                    else:
+                        auto_calls.append(tc)
+
+                # Execute all auto-execute tools first
+                for tc in auto_calls:
                     tool_name = tc.function.name
-                    arguments = tc.function.arguments
-
-                    # Check if tool requires confirmation
-                    if self._tools.needs_confirmation(tool_name):
-                        self._pending_confirmations[thread_ts] = {
-                            "tool_call_id": tc.id,
-                            "tool_name": tool_name,
-                            "arguments": arguments,
-                            "messages": messages,
-                        }
-                        # Save the user message before returning
-                        user_msg = messages[-2] if len(messages) >= 2 else messages[-1]
-                        if user_msg.get("role") == "user":
-                            await queries.save_conversation_message(
-                                self._db.conn, thread_ts, channel_id,
-                                role="user", content=user_msg["content"],
-                            )
-                        confirmation_text = (
-                            f"I need to run *{tool_name}* "
-                            f"with arguments: `{arguments}`\n\n"
-                            "Reply *yes* to confirm or *no* to cancel."
-                        )
-                        await queries.log_llm_usage(
-                            self._db.conn, "conversation", self._settings.kimi_model,
-                            total_in, total_out,
-                        )
-                        return confirmation_text
-
-                    # Execute tool
                     log.info("tool.executing", tool=tool_name, round=_round)
-                    result = await self._tools.execute(tool_name, arguments)
+                    result = await self._tools.execute(tool_name, tc.function.arguments)
 
-                    # Add tool result to messages
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": result,
                     })
-
-                    # Save tool result to DB
                     await queries.save_conversation_message(
                         self._db.conn, thread_ts, channel_id,
                         role="tool", content=result,
                         tool_call_id=tc.id, name=tool_name,
                     )
+
+                # If there are confirmation-needed tools, pause and ask
+                if confirm_calls:
+                    self._pending_confirmations[thread_ts] = {
+                        "pending_tools": [
+                            {"tool_call_id": tc.id, "tool_name": tc.function.name,
+                             "arguments": tc.function.arguments}
+                            for tc in confirm_calls
+                        ],
+                        "messages": messages,
+                    }
+                    # Save the user message before returning
+                    for msg in reversed(messages):
+                        if msg.get("role") == "user" and msg.get("content"):
+                            await queries.save_conversation_message(
+                                self._db.conn, thread_ts, channel_id,
+                                role="user", content=msg["content"],
+                            )
+                            break
+
+                    # Build confirmation prompt listing all pending tools
+                    lines = []
+                    for tc in confirm_calls:
+                        lines.append(f"• *{tc.function.name}*: `{tc.function.arguments}`")
+                    confirmation_text = (
+                        "I need to run the following:\n"
+                        + "\n".join(lines)
+                        + "\n\nReply *yes* to confirm or *no* to cancel."
+                    )
+                    await queries.log_llm_usage(
+                        self._db.conn, "conversation", self._settings.kimi_model,
+                        total_in, total_out,
+                    )
+                    return confirmation_text
 
                 # Continue loop to get LLM response after tool results
                 continue
@@ -288,27 +368,43 @@ class ConversationManager:
         normalized = text.strip().lower()
 
         if normalized in ("yes", "y", "确认", "是"):
-            # Execute the pending tool
-            result = await self._tools.execute(
-                pending["tool_name"], pending["arguments"]
-            )
-
-            # Rebuild messages and add tool result
             messages = pending["messages"]
-            messages.append({
-                "role": "tool",
-                "tool_call_id": pending["tool_call_id"],
-                "content": result,
-            })
 
-            await queries.save_conversation_message(
-                self._db.conn, thread_ts, channel_id,
-                role="tool", content=result,
-                tool_call_id=pending["tool_call_id"],
-                name=pending["tool_name"],
-            )
+            # Execute all pending confirmation tools
+            for tool_info in pending["pending_tools"]:
+                result = await self._tools.execute(
+                    tool_info["tool_name"], tool_info["arguments"]
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_info["tool_call_id"],
+                    "content": result,
+                })
+                await queries.save_conversation_message(
+                    self._db.conn, thread_ts, channel_id,
+                    role="tool", content=result,
+                    tool_call_id=tool_info["tool_call_id"],
+                    name=tool_info["tool_name"],
+                )
 
             # Continue the conversation loop
             return await self._run_tool_loop(messages, thread_ts, channel_id)
+
+        # User cancelled — still need to send tool responses so the
+        # conversation history stays valid for the next API call.
+        messages = pending["messages"]
+        for tool_info in pending["pending_tools"]:
+            cancelled_result = json.dumps({"cancelled": True, "reason": "User declined"})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_info["tool_call_id"],
+                "content": cancelled_result,
+            })
+            await queries.save_conversation_message(
+                self._db.conn, thread_ts, channel_id,
+                role="tool", content=cancelled_result,
+                tool_call_id=tool_info["tool_call_id"],
+                name=tool_info["tool_name"],
+            )
 
         return "Cancelled. The operation was not executed."

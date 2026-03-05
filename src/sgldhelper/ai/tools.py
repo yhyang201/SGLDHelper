@@ -9,9 +9,7 @@ import structlog
 
 from sgldhelper.db import queries
 from sgldhelper.db.engine import Database
-from sgldhelper.github.ci_rerunner import CIRerunner
 from sgldhelper.github.client import GitHubClient
-from sgldhelper.github.issue_tracker import IssueTracker
 from sgldhelper.config import Settings
 
 log = structlog.get_logger()
@@ -32,17 +30,20 @@ class ToolRegistry:
         self,
         db: Database,
         gh: GitHubClient,
-        rerunner: CIRerunner,
-        issue_tracker: IssueTracker,
         settings: Settings,
     ) -> None:
         self._db = db
         self._gh = gh
-        self._rerunner = rerunner
-        self._issue_tracker = issue_tracker
         self._settings = settings
+        self._ci_monitor: Any = None
+        self._auto_merge: Any = None
         self._tools: dict[str, _ToolDef] = {}
         self._register_all()
+
+    def set_ci_components(self, ci_monitor: Any, auto_merge: Any) -> None:
+        """Inject CI monitor and auto-merge manager after construction."""
+        self._ci_monitor = ci_monitor
+        self._auto_merge = auto_merge
 
     def _register_all(self) -> None:
         """Register all available tools."""
@@ -68,45 +69,6 @@ class ToolRegistry:
         )
 
         self._register(
-            name="get_ci_status",
-            description="Get CI run results for a diffusion PR, including job names, status, failure categories",
-            parameters={
-                "type": "object",
-                "required": ["pr_number"],
-                "properties": {
-                    "pr_number": {"type": "integer", "description": "PR number"},
-                },
-            },
-            handler=self._get_ci_status,
-        )
-
-        self._register(
-            name="get_feature_progress",
-            description="Get feature roadmap progress for a specific issue, including completion percentage and item list",
-            parameters={
-                "type": "object",
-                "required": ["issue_number"],
-                "properties": {
-                    "issue_number": {"type": "integer", "description": "GitHub issue number"},
-                },
-            },
-            handler=self._get_feature_progress,
-        )
-
-        self._register(
-            name="get_feature_items",
-            description="Get all feature checklist items for a roadmap issue",
-            parameters={
-                "type": "object",
-                "required": ["parent_issue"],
-                "properties": {
-                    "parent_issue": {"type": "integer", "description": "Parent issue number"},
-                },
-            },
-            handler=self._get_feature_items,
-        )
-
-        self._register(
             name="get_pr_reviews",
             description="Get review status for a PR from GitHub (approved, changes requested, etc.)",
             parameters={
@@ -121,7 +83,7 @@ class ToolRegistry:
 
         self._register(
             name="search_prs",
-            description="Search PRs by title or author keyword",
+            description="Search PRs in the local database by title or author keyword. Use search_github_prs for broader search across the whole repo.",
             parameters={
                 "type": "object",
                 "required": ["query"],
@@ -133,8 +95,39 @@ class ToolRegistry:
         )
 
         self._register(
+            name="search_github_prs",
+            description=(
+                "Search PRs across the entire GitHub repo using the GitHub Search API. "
+                "Accepts multiple keywords for fuzzy matching. "
+                "Use this when the user vaguely describes a PR they remember."
+            ),
+            parameters={
+                "type": "object",
+                "required": ["keywords"],
+                "properties": {
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of keywords to search for (e.g. ['diffusion', 'interpolation', 'fix'])",
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["open", "closed"],
+                        "description": "Filter by PR state (optional, omit for all)",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max number of results to return (default 10)",
+                        "default": 10,
+                    },
+                },
+            },
+            handler=self._search_github_prs,
+        )
+
+        self._register(
             name="get_recent_activity",
-            description="Get recent PR, CI, and feature activity from the last N hours",
+            description="Get recent PR activity from the last N hours",
             parameters={
                 "type": "object",
                 "properties": {
@@ -143,31 +136,6 @@ class ToolRegistry:
                 "required": [],
             },
             handler=self._get_recent_activity,
-        )
-
-        self._register(
-            name="get_stalled_features",
-            description="Find open feature items whose linked PRs haven't been updated recently",
-            parameters={
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-            handler=self._get_stalled_features,
-        )
-
-        self._register(
-            name="rerun_ci",
-            description="Rerun failed CI jobs for a PR. This is a WRITE operation that triggers CI pipelines.",
-            parameters={
-                "type": "object",
-                "required": ["pr_number"],
-                "properties": {
-                    "pr_number": {"type": "integer", "description": "PR number"},
-                },
-            },
-            handler=self._rerun_ci,
-            requires_confirmation=True,
         )
 
         self._register(
@@ -213,27 +181,6 @@ class ToolRegistry:
         )
 
         self._register(
-            name="link_pr_to_feature",
-            description="Link a PR to a feature roadmap item so stall detection covers it",
-            parameters={
-                "type": "object",
-                "required": ["pr_number", "item_id"],
-                "properties": {
-                    "pr_number": {"type": "integer", "description": "PR number to link"},
-                    "item_id": {"type": "string", "description": "Feature item ID to bind the PR to"},
-                },
-            },
-            handler=self._link_pr_to_feature,
-        )
-
-        self._register(
-            name="get_unlinked_features",
-            description="List open feature items that have no linked PR (candidates for binding)",
-            parameters={"type": "object", "properties": {}, "required": []},
-            handler=self._get_unlinked_features,
-        )
-
-        self._register(
             name="review_pr_code",
             description="Fetch the full diff of a PR for inline code review",
             parameters={
@@ -244,6 +191,90 @@ class ToolRegistry:
                 },
             },
             handler=self._review_pr_code,
+        )
+
+        self._register(
+            name="get_ci_status",
+            description="Get the current CI status (Nvidia + AMD workflows) for a PR",
+            parameters={
+                "type": "object",
+                "required": ["pr_number"],
+                "properties": {
+                    "pr_number": {"type": "integer", "description": "PR number"},
+                },
+            },
+            handler=self._get_ci_status,
+        )
+
+        self._register(
+            name="trigger_ci",
+            description="Trigger CI for a PR by adding the run-ci label via comment",
+            parameters={
+                "type": "object",
+                "required": ["pr_number"],
+                "properties": {
+                    "pr_number": {"type": "integer", "description": "PR number"},
+                },
+            },
+            handler=self._trigger_ci,
+        )
+
+        self._register(
+            name="cancel_auto_merge",
+            description="Cancel a pending auto-merge for a PR",
+            parameters={
+                "type": "object",
+                "required": ["pr_number"],
+                "properties": {
+                    "pr_number": {"type": "integer", "description": "PR number"},
+                },
+            },
+            handler=self._cancel_auto_merge,
+            requires_confirmation=True,
+        )
+
+        self._register(
+            name="merge_pr",
+            description=(
+                "Merge a pull request on GitHub via squash merge. "
+                "Use when a user explicitly asks to merge a PR. "
+                "Before calling, verify CI is passed and the PR has approval."
+            ),
+            parameters={
+                "type": "object",
+                "required": ["pr_number"],
+                "properties": {
+                    "pr_number": {"type": "integer", "description": "PR number"},
+                    "merge_method": {
+                        "type": "string",
+                        "enum": ["squash", "merge", "rebase"],
+                        "description": "Merge method (default: squash)",
+                    },
+                },
+            },
+            handler=self._merge_pr,
+            requires_confirmation=True,
+        )
+
+        self._register(
+            name="get_merge_ready_prs",
+            description=(
+                "Batch-check all open diffusion PRs (or tracked PRs) and return "
+                "only those that are ready to merge (CI passed + approved + mergeable). "
+                "Use this when the user asks 'which PRs can be merged' or 'merge所有可以merge的PR'."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "tracked_only": {
+                        "type": "boolean",
+                        "description": "If true, only check the current user's tracked PRs. Default false (all open diffusion PRs).",
+                        "default": False,
+                    },
+                },
+                "required": [],
+            },
+            handler=self._get_merge_ready_prs,
         )
 
     def _register(
@@ -344,60 +375,6 @@ class ToolRegistry:
                 return dict(db_pr)
             return {"error": f"PR #{pr_number} not found"}
 
-    async def _get_ci_status(self, pr_number: int) -> list[dict[str, Any]]:
-        db_runs = await queries.get_ci_runs_for_pr(self._db.conn, pr_number)
-        if db_runs:
-            return [
-                {
-                    "run_id": r["run_id"],
-                    "job_name": r["job_name"],
-                    "status": r["status"],
-                    "conclusion": r["conclusion"],
-                    "failure_category": r["failure_category"],
-                    "failure_summary": (r["failure_summary"] or "")[:300],
-                    "auto_rerun_count": r["auto_rerun_count"],
-                }
-                for r in db_runs[:15]
-            ]
-        # Fallback: query GitHub directly for CI runs
-        try:
-            pr = await self._gh.get_pull(pr_number)
-            head_sha = pr.get("head", {}).get("sha", "")
-            if not head_sha:
-                return []
-            workflow_runs = await self._gh.get_workflow_runs_for_ref(head_sha)
-            results = []
-            for wr in workflow_runs[:10]:
-                results.append({
-                    "run_id": wr["id"],
-                    "job_name": wr.get("name", "unknown"),
-                    "status": wr.get("status", "unknown"),
-                    "conclusion": wr.get("conclusion"),
-                    "html_url": wr.get("html_url", ""),
-                })
-            return results
-        except Exception as e:
-            log.warning("tool.ci_github_fallback_failed", error=str(e))
-            return []
-
-    async def _get_feature_progress(self, issue_number: int) -> dict[str, Any]:
-        progress = await self._issue_tracker.get_progress(issue_number)
-        return {
-            "issue_number": progress.issue_number,
-            "title": progress.title,
-            "total": progress.total,
-            "completed": progress.completed,
-            "percent": round(progress.percent, 1),
-            "items": [
-                {"title": i["title"] if isinstance(i, dict) else i.title,
-                 "state": i["state"] if isinstance(i, dict) else i.state}
-                for i in progress.items[:20]
-            ],
-        }
-
-    async def _get_feature_items(self, parent_issue: int) -> list[dict[str, Any]]:
-        return await queries.get_feature_items(self._db.conn, parent_issue)
-
     async def _get_pr_reviews(self, pr_number: int) -> list[dict[str, Any]]:
         reviews = await self._gh.get_pull_reviews(pr_number)
         return [
@@ -412,23 +389,33 @@ class ToolRegistry:
     async def _search_prs(self, query: str) -> list[dict[str, Any]]:
         return await queries.search_prs(self._db.conn, query)
 
+    async def _search_github_prs(
+        self,
+        keywords: list[str],
+        state: str | None = None,
+        max_results: int = 10,
+    ) -> list[dict[str, Any]]:
+        try:
+            items = await self._gh.search_issues(
+                keywords, is_pr=True, state=state, max_results=max_results,
+            )
+            return [
+                {
+                    "pr_number": item["number"],
+                    "title": item["title"],
+                    "author": item.get("user", {}).get("login", "unknown"),
+                    "state": item["state"],
+                    "labels": [l["name"] for l in item.get("labels", [])],
+                    "updated_at": item.get("updated_at", ""),
+                    "html_url": item.get("html_url", ""),
+                }
+                for item in items
+            ]
+        except Exception as e:
+            return [{"error": f"GitHub search failed: {e}"}]
+
     async def _get_recent_activity(self, since_hours: int = 24) -> dict[str, Any]:
         return await queries.get_recent_activity(self._db.conn, since_hours)
-
-    async def _get_stalled_features(self) -> list[dict[str, Any]]:
-        return await queries.get_stalled_features(
-            self._db.conn, self._settings.stall_days_threshold
-        )
-
-    async def _rerun_ci(self, pr_number: int) -> dict[str, Any]:
-        results = await self._rerunner.manual_rerun(pr_number)
-        return {
-            "pr_number": pr_number,
-            "results": [
-                {"run_id": r.run_id, "triggered": r.triggered, "reason": r.reason}
-                for r in results
-            ],
-        }
 
     async def _get_my_preferences(self) -> dict[str, Any]:
         from sgldhelper.ai.conversation import _current_user
@@ -461,18 +448,6 @@ class ToolRegistry:
         await queries.save_user_note(self._db.conn, user_id, note)
         return {"user_id": user_id, "note": note, "saved": True}
 
-    async def _link_pr_to_feature(self, pr_number: int, item_id: str) -> dict[str, Any]:
-        pr = await queries.get_pr(self._db.conn, pr_number)
-        if not pr:
-            return {"error": f"PR #{pr_number} not found in database"}
-        updated = await queries.update_feature_linked_pr(self._db.conn, item_id, pr_number)
-        if not updated:
-            return {"error": f"Feature item '{item_id}' not found"}
-        return {"success": True, "item_id": item_id, "linked_pr": pr_number}
-
-    async def _get_unlinked_features(self) -> list[dict[str, Any]]:
-        return await queries.get_unlinked_features(self._db.conn)
-
     async def _review_pr_code(self, pr_number: int) -> dict[str, Any]:
         diff = await self._gh.get_pull_diff(pr_number)
         if not diff:
@@ -481,6 +456,139 @@ class ToolRegistry:
         if truncated:
             diff = diff[:_DIFF_MAX_CHARS]
         return {"pr_number": pr_number, "diff": diff, "truncated": truncated}
+
+    async def _get_ci_status(self, pr_number: int) -> dict[str, Any]:
+        if not self._ci_monitor:
+            return {"error": "CI monitor not initialized"}
+        try:
+            pr_data = await self._gh.get_pull(pr_number)
+            head_sha = pr_data["head"]["sha"]
+            ci_status = await self._ci_monitor.check_pr_ci(
+                pr_number, head_sha, pr_data=pr_data,
+            )
+            return {
+                "pr_number": pr_number,
+                "head_sha": head_sha[:8],
+                "overall": ci_status.overall.value,
+                "has_run_ci_label": ci_status.has_run_ci_label,
+                "all_runs_completed": ci_status.all_runs_completed,
+                "nvidia_jobs": [
+                    {"name": j.job_name, "status": j.status, "conclusion": j.conclusion}
+                    for j in ci_status.nvidia_jobs
+                ],
+                "amd_jobs": [
+                    {"name": j.job_name, "status": j.status, "conclusion": j.conclusion}
+                    for j in ci_status.amd_jobs
+                ],
+                "failed_jobs": [
+                    {"name": j.job_name, "workflow": j.workflow_name}
+                    for j in ci_status.failed_jobs
+                ],
+            }
+        except Exception as e:
+            return {"error": f"Failed to get CI status: {e}"}
+
+    async def _trigger_ci(self, pr_number: int) -> dict[str, Any]:
+        if not self._ci_monitor:
+            return {"error": "CI monitor not initialized"}
+        try:
+            pr_data = await self._gh.get_pull(pr_number)
+            labels = [l["name"].lower() for l in pr_data.get("labels", [])]
+            has_label = "run-ci" in labels
+            await self._ci_monitor.trigger_ci(pr_number, has_label)
+            return {"pr_number": pr_number, "triggered": True, "method": "rerun" if has_label else "comment"}
+        except Exception as e:
+            return {"error": f"Failed to trigger CI: {e}"}
+
+    async def _cancel_auto_merge(self, pr_number: int) -> dict[str, Any]:
+        if not self._auto_merge:
+            return {"error": "Auto-merge manager not initialized"}
+        cancelled = await self._auto_merge.cancel(pr_number)
+        if cancelled:
+            return {"pr_number": pr_number, "cancelled": True}
+        return {"pr_number": pr_number, "cancelled": False, "reason": "No pending merge found"}
+
+    async def _get_merge_ready_prs(self, tracked_only: bool = False) -> list[dict[str, Any]]:
+        """Batch-check PRs and return those ready to merge."""
+        # Determine which PRs to check
+        if tracked_only:
+            from sgldhelper.ai.conversation import _current_user
+            user_id = _current_user.get()
+            mem = await queries.get_user_memory(self._db.conn, user_id)
+            if not mem:
+                return []
+            pr_numbers = json.loads(mem["tracked_prs"])
+        else:
+            db_prs = await queries.get_open_prs(self._db.conn)
+            pr_numbers = [p["pr_number"] for p in db_prs]
+
+        if not pr_numbers:
+            return []
+
+        ready: list[dict[str, Any]] = []
+        for pr_num in pr_numbers:
+            try:
+                pr_data = await self._gh.get_pull(pr_num)
+            except Exception:
+                continue
+
+            if pr_data["state"] != "open":
+                continue
+
+            # Check mergeable
+            if not pr_data.get("mergeable"):
+                continue
+
+            # Check reviews
+            reviews = await self._gh.get_pull_reviews(pr_num)
+            has_approval = any(r.get("state") == "APPROVED" for r in reviews)
+            if not has_approval:
+                continue
+
+            # Check CI
+            head_sha = pr_data["head"]["sha"]
+            if self._ci_monitor:
+                ci_status = await self._ci_monitor.check_pr_ci(
+                    pr_num, head_sha, pr_data=pr_data,
+                )
+                ci_passed = ci_status.overall.value == "passed"
+            else:
+                ci_passed = False
+
+            if not ci_passed:
+                continue
+
+            ready.append({
+                "pr_number": pr_num,
+                "title": pr_data["title"],
+                "author": pr_data["user"]["login"],
+                "head_sha": head_sha[:8],
+                "html_url": pr_data.get("html_url", ""),
+            })
+
+        return ready
+
+    async def _merge_pr(
+        self, pr_number: int, merge_method: str = "squash"
+    ) -> dict[str, Any]:
+        try:
+            result = await self._gh.merge_pull(pr_number, merge_method=merge_method)
+            # Cancel any pending auto-merge for this PR
+            if self._auto_merge:
+                await self._auto_merge.cancel(pr_number)
+            return {
+                "pr_number": pr_number,
+                "merged": True,
+                "merge_method": merge_method,
+                "message": result.get("message", "Successfully merged"),
+            }
+        except Exception as e:
+            error_msg = str(e)
+            if "405" in error_msg:
+                return {"error": f"PR #{pr_number} is not mergeable (conflicts, checks failing, or not approved)"}
+            if "404" in error_msg:
+                return {"error": f"PR #{pr_number} not found"}
+            return {"error": f"Merge failed: {error_msg}"}
 
 
 class _ToolDef:

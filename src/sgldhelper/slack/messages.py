@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from sgldhelper.github.ci_analyzer import CIResult, FailureCategory
-from sgldhelper.github.issue_tracker import FeatureProgress
+if TYPE_CHECKING:
+    from sgldhelper.ci.monitor import CIJobResult, CIStatus
+
 from sgldhelper.github.pr_tracker import PRChange, PREvent
 
 
 def _pr_url(repo: str, pr_number: int) -> str:
     return f"https://github.com/{repo}/pull/{pr_number}"
-
-
-def _run_url(repo: str, run_id: int) -> str:
-    return f"https://github.com/{repo}/actions/runs/{run_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -45,12 +42,6 @@ def build_pr_opened(change: PRChange, repo: str) -> dict[str, Any]:
                         "type": "button",
                         "text": {"type": "plain_text", "text": "View PR"},
                         "url": url,
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "CI Status"},
-                        "action_id": "ci_status",
-                        "value": str(pr["pr_number"]),
                     },
                 ],
             },
@@ -122,96 +113,42 @@ def build_pr_closed(change: PRChange, repo: str) -> dict[str, Any]:
 
 PR_MESSAGE_BUILDERS = {
     PREvent.OPENED: build_pr_opened,
-    PREvent.UPDATED: build_pr_updated,
     PREvent.MERGED: build_pr_merged,
     PREvent.CLOSED: build_pr_closed,
 }
 
 
 # ---------------------------------------------------------------------------
+# AI-related messages
+# ---------------------------------------------------------------------------
+
+def _mention_users(user_ids: list[str]) -> str:
+    return " ".join(f"<@{uid}>" for uid in user_ids)
+
+
+# ---------------------------------------------------------------------------
 # CI messages
 # ---------------------------------------------------------------------------
 
-_CATEGORY_EMOJI = {
-    FailureCategory.FLAKY: ":game_die:",
-    FailureCategory.INFRA: ":building_construction:",
-    FailureCategory.PERF_REGRESSION: ":chart_with_downwards_trend:",
-    FailureCategory.CODE: ":bug:",
-    FailureCategory.UNKNOWN: ":question:",
-}
-
-
-def build_ci_failure(result: CIResult, repo: str) -> dict[str, Any]:
-    emoji = _CATEGORY_EMOJI.get(result.failure_category, ":x:")
-    cat = result.failure_category.value if result.failure_category else "unknown"
-    url = result.html_url or _run_url(repo, result.run_id)
-    summary = result.failure_summary or "No details"
-    return {
-        "text": f"CI failure on PR #{result.pr_number}: {cat}",
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"{emoji} *CI Failure* on PR #{result.pr_number}\n"
-                        f"Job: `{result.job_name}` | Category: *{cat}*\n"
-                        f"```{summary[:500]}```"
-                    ),
-                },
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "View Logs"},
-                        "url": url,
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Rerun CI"},
-                        "action_id": "rerun_ci",
-                        "value": f"{result.run_id}:{result.pr_number}",
-                        "style": "danger",
-                    },
-                ],
-            },
-        ],
-    }
-
-
-def build_ci_success(pr_number: int, repo: str) -> dict[str, Any]:
+def build_ci_passed(
+    pr_number: int, ci_status: CIStatus, user_ids: list[str], repo: str
+) -> dict[str, Any]:
     url = _pr_url(repo, pr_number)
+    mentions = _mention_users(user_ids)
+    nvidia_count = len(ci_status.nvidia_jobs)
+    amd_count = len(ci_status.amd_jobs)
+    text = f"CI passed for PR #{pr_number}"
     return {
-        "text": f"CI passed on PR #{pr_number}",
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f":white_check_mark: *<{url}|PR #{pr_number}>* CI passed!",
-                },
-            },
-        ],
-    }
-
-
-def build_ci_rerun(result: CIResult, auto: bool, repo: str) -> dict[str, Any]:
-    url = result.html_url or _run_url(repo, result.run_id)
-    trigger = "Auto-rerun" if auto else "Manual rerun"
-    cat = result.failure_category.value if result.failure_category else "unknown"
-    return {
-        "text": f"{trigger} triggered for PR #{result.pr_number}",
+        "text": text,
         "blocks": [
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        f":repeat: *{trigger}* triggered for <{url}|run {result.run_id}>\n"
-                        f"PR #{result.pr_number} | Reason: {cat}\n"
-                        f"Attempt #{result.auto_rerun_count + 1}"
+                        f":white_check_mark: *<{url}|PR #{pr_number}>* CI 全部通过!\n"
+                        f"Nvidia jobs: {nvidia_count} | AMD jobs: {amd_count}\n"
+                        f"cc {mentions}"
                     ),
                 },
             },
@@ -219,81 +156,177 @@ def build_ci_rerun(result: CIResult, auto: bool, repo: str) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Feature progress messages
-# ---------------------------------------------------------------------------
-
-def build_feature_progress(progress: FeatureProgress, repo: str) -> dict[str, Any]:
-    issue_url = f"https://github.com/{repo}/issues/{progress.issue_number}"
-    bar_len = 20
-    filled = int(progress.percent / 100 * bar_len)
-    bar = "=" * filled + "-" * (bar_len - filled)
-
-    items_text = ""
-    for item in progress.items[:15]:  # Show at most 15 items
-        check = ":white_check_mark:" if item["state"] == "completed" else ":white_large_square:"
-        items_text += f"{check} {item['title']}\n"
-    if len(progress.items) > 15:
-        items_text += f"_...and {len(progress.items) - 15} more items_\n"
-
-    return {
-        "text": f"Feature Progress: {progress.title}",
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f":bar_chart: *<{issue_url}|{progress.title}>*\n"
-                        f"`[{bar}]` {progress.percent:.0f}% "
-                        f"({progress.completed}/{progress.total})"
-                    ),
-                },
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": items_text or "_No items found_",
-                },
-            },
-        ],
-    }
-
-
-def build_daily_digest(
-    open_prs: list[dict[str, Any]],
-    progress_list: list[FeatureProgress],
+def build_ci_failed_retrying(
+    pr_number: int,
+    retryable_jobs: list[CIJobResult],
+    user_ids: list[str],
     repo: str,
 ) -> dict[str, Any]:
-    pr_lines = ""
-    for pr in open_prs[:10]:
-        url = _pr_url(repo, pr["pr_number"])
-        pr_lines += f"- <{url}|#{pr['pr_number']}> {pr['title']} (`{pr['author']}`)\n"
-
-    feature_lines = ""
-    for p in progress_list:
-        feature_lines += f"- {p.title}: {p.percent:.0f}% ({p.completed}/{p.total})\n"
-
+    url = _pr_url(repo, pr_number)
+    mentions = _mention_users(user_ids)
+    job_lines = "\n".join(
+        f"• `{j.job_name}` ({j.workflow_name})" for j in retryable_jobs
+    )
+    text = f"CI failed for PR #{pr_number}, retrying..."
     return {
-        "text": "Daily Diffusion Digest",
+        "text": text,
         "blocks": [
             {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "Daily Diffusion Digest"},
-            },
-            {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*Open PRs ({len(open_prs)}):*\n{pr_lines or '_None_'}",
+                    "text": (
+                        f":arrows_counterclockwise: *<{url}|PR #{pr_number}>* CI 失败，正在重试:\n"
+                        f"{job_lines}\n"
+                        f"cc {mentions}"
+                    ),
                 },
             },
+        ],
+    }
+
+
+def build_ci_failed_permanent(
+    pr_number: int,
+    permanent_jobs: list[CIJobResult],
+    user_ids: list[str],
+    repo: str,
+) -> dict[str, Any]:
+    url = _pr_url(repo, pr_number)
+    mentions = _mention_users(user_ids)
+    job_lines = "\n".join(
+        f"• `{j.job_name}` ({j.workflow_name})" for j in permanent_jobs
+    )
+    text = f"CI permanently failed for PR #{pr_number}"
+    return {
+        "text": text,
+        "blocks": [
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*Feature Progress:*\n{feature_lines or '_None_'}",
+                    "text": (
+                        f":x: *<{url}|PR #{pr_number}>* CI 多次重试后仍然失败，疑似代码问题:\n"
+                        f"{job_lines}\n"
+                        f"已停止自动重试。cc {mentions}"
+                    ),
+                },
+            },
+        ],
+    }
+
+
+def build_merge_countdown(
+    pr_number: int, user_ids: list[str], delay_seconds: int, repo: str
+) -> dict[str, Any]:
+    url = _pr_url(repo, pr_number)
+    mentions = _mention_users(user_ids)
+    minutes = delay_seconds // 60
+    text = f"PR #{pr_number} will auto-merge in {minutes} minutes"
+    return {
+        "text": text,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":hourglass_flowing_sand: *<{url}|PR #{pr_number}>* 将在 {minutes} 分钟后自动 squash merge\n"
+                        f"说「取消」或「cancel merge」可以取消。cc {mentions}"
+                    ),
+                },
+            },
+        ],
+    }
+
+
+def build_merge_complete(
+    pr_number: int, user_ids: list[str], repo: str
+) -> dict[str, Any]:
+    url = _pr_url(repo, pr_number)
+    mentions = _mention_users(user_ids)
+    text = f"PR #{pr_number} auto-merged"
+    return {
+        "text": text,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":merged: *<{url}|PR #{pr_number}>* 已自动 squash merge!\n"
+                        f"cc {mentions}"
+                    ),
+                },
+            },
+        ],
+    }
+
+
+def build_merge_cancelled(
+    pr_number: int, user_ids: list[str], repo: str
+) -> dict[str, Any]:
+    url = _pr_url(repo, pr_number)
+    mentions = _mention_users(user_ids)
+    text = f"PR #{pr_number} auto-merge cancelled"
+    return {
+        "text": text,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":no_entry_sign: *<{url}|PR #{pr_number}>* 自动合并已取消\n"
+                        f"cc {mentions}"
+                    ),
+                },
+            },
+        ],
+    }
+
+
+def build_pr_untracked(
+    pr_number: int, user_ids: list[str], reason: str, repo: str
+) -> dict[str, Any]:
+    url = _pr_url(repo, pr_number)
+    mentions = _mention_users(user_ids)
+    text = f"PR #{pr_number} untracked: {reason}"
+    return {
+        "text": text,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":ballot_box_with_check: *<{url}|PR #{pr_number}>* 已自动取消追踪 ({reason})\n"
+                        f"cc {mentions}"
+                    ),
+                },
+            },
+        ],
+    }
+
+
+def build_tracked_pr_summary(
+    pr_number: int, user_ids: list[str], summary: str, repo: str
+) -> dict[str, Any]:
+    url = _pr_url(repo, pr_number)
+    mentions = _mention_users(user_ids)
+    text = f"Tracked PR #{pr_number} summary"
+    return {
+        "text": text,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":bar_chart: *<{url}|PR #{pr_number}>* 追踪更新:\n\n"
+                        f"{summary}\n\n"
+                        f"cc {mentions}"
+                    ),
                 },
             },
         ],
@@ -303,38 +336,6 @@ def build_daily_digest(
 # ---------------------------------------------------------------------------
 # AI-related messages
 # ---------------------------------------------------------------------------
-
-def build_stall_alert(
-    alert: Any, trackers: list[str] | None = None
-) -> dict[str, Any]:
-    """Build a stall/nudge notification message."""
-    from sgldhelper.ai.stall_detector import StallAlert
-
-    if alert.alert_type == "feature_stall":
-        emoji = ":snail:"
-        title = "Feature Stall Detected"
-    else:
-        emoji = ":eyes:"
-        title = "Review Needed"
-
-    pr_text = f" (PR #{alert.pr_number})" if alert.pr_number else ""
-    body = f"{emoji} *{title}*\n{alert.details}"
-    if trackers:
-        mentions = ", ".join(f"<@{uid}>" for uid in trackers)
-        body += f"\ncc {mentions}"
-    return {
-        "text": f"{title}: {alert.title}{pr_text}",
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": body,
-                },
-            },
-        ],
-    }
-
 
 def build_progress_confirmation(result: dict[str, Any]) -> dict[str, Any]:
     """Build a confirmation message for a detected progress update or blocker."""

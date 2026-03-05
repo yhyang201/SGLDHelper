@@ -71,7 +71,7 @@ class TestClassifyMessage:
         result = await classifier.classify_message(
             text="I'm blocked on SDXL support - getting GPU OOM on large batch sizes",
             user_id="U456",
-            channel_id="C_TEST_FEAT",
+            channel_id="C_TEST_CI",
             message_ts="1234567890.789012",
         )
 
@@ -110,63 +110,6 @@ class TestClassifyMessage:
         assert result is None
         mock_kimi.classify.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_feature_item_matching_by_pr(self, classifier, mock_kimi, db):
-        from sgldhelper.db import queries
-
-        # Insert a feature item with linked PR
-        await queries.upsert_feature_item(db.conn, {
-            "item_id": "abc123",
-            "parent_issue": 14199,
-            "title": "Add ControlNet",
-            "state": "open",
-            "linked_pr": 1234,
-        })
-
-        mock_kimi.classify = AsyncMock(return_value={
-            "category": "progress_update",
-            "summary": "ControlNet PR done",
-            "mentioned_pr": 1234,
-            "mentioned_feature": None,
-        })
-
-        result = await classifier.classify_message(
-            text="ControlNet PR #1234 is done and merged",
-            user_id="U123",
-            channel_id="C_TEST_FEAT",
-            message_ts="1234567890.111111",
-        )
-
-        assert result is not None
-        assert result["matched_item_id"] == "abc123"
-
-    @pytest.mark.asyncio
-    async def test_feature_item_matching_by_title(self, classifier, mock_kimi, db):
-        from sgldhelper.db import queries
-
-        await queries.upsert_feature_item(db.conn, {
-            "item_id": "def456",
-            "parent_issue": 14199,
-            "title": "SDXL Support",
-            "state": "open",
-        })
-
-        mock_kimi.classify = AsyncMock(return_value={
-            "category": "progress_update",
-            "summary": "SDXL work completed",
-            "mentioned_pr": None,
-            "mentioned_feature": "SDXL Support",
-        })
-
-        result = await classifier.classify_message(
-            text="Finished working on SDXL support, all tests pass",
-            user_id="U123",
-            channel_id="C_TEST_FEAT",
-            message_ts="1234567890.222222",
-        )
-
-        assert result is not None
-        assert result["matched_item_id"] == "def456"
 
 
 class TestDetectedUpdatesDB:

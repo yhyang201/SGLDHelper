@@ -72,9 +72,6 @@ class MessageClassifier:
         if category not in ("progress_update", "blocker"):
             return None
 
-        # Try to match to a feature item
-        matched_item_id = await self._match_feature_item(result)
-
         # Save to DB
         update_id = await queries.save_detected_update(
             self._db.conn,
@@ -83,7 +80,6 @@ class MessageClassifier:
             user_id=user_id,
             classification=category,
             extracted_data=json.dumps(result),
-            matched_item_id=matched_item_id,
         )
 
         return {
@@ -92,30 +88,7 @@ class MessageClassifier:
             "summary": result.get("summary", ""),
             "mentioned_pr": result.get("mentioned_pr"),
             "mentioned_feature": result.get("mentioned_feature"),
-            "matched_item_id": matched_item_id,
         }
-
-    async def _match_feature_item(self, classification: dict[str, Any]) -> str | None:
-        """Try to match a classification result to a feature item."""
-        mentioned_pr = classification.get("mentioned_pr")
-        mentioned_feature = classification.get("mentioned_feature")
-
-        if mentioned_pr:
-            # Try matching by linked PR number
-            items = await queries.get_all_feature_items(self._db.conn)
-            for item in items:
-                if item.get("linked_pr") == mentioned_pr:
-                    return item["item_id"]
-
-        if mentioned_feature:
-            # Fuzzy match by title
-            items = await queries.get_all_feature_items(self._db.conn)
-            feature_lower = mentioned_feature.lower()
-            for item in items:
-                if feature_lower in item["title"].lower():
-                    return item["item_id"]
-
-        return None
 
     def _might_be_relevant(self, text: str) -> bool:
         """Quick heuristic check before calling LLM."""

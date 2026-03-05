@@ -15,42 +15,6 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS ci_runs (
-    run_id              INTEGER PRIMARY KEY,
-    pr_number           INTEGER NOT NULL,
-    job_name            TEXT NOT NULL,
-    head_sha            TEXT NOT NULL,
-    status              TEXT NOT NULL,
-    conclusion          TEXT,
-    failure_category    TEXT,
-    failure_summary     TEXT,
-    auto_rerun_count    INTEGER NOT NULL DEFAULT 0,
-    html_url            TEXT,
-    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (pr_number) REFERENCES pull_requests(pr_number)
-);
-
-CREATE TABLE IF NOT EXISTS ci_rerun_log (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id          INTEGER NOT NULL,
-    new_run_id      INTEGER,
-    triggered_by    TEXT NOT NULL DEFAULT 'auto',
-    reason          TEXT,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (run_id) REFERENCES ci_runs(run_id)
-);
-
-CREATE TABLE IF NOT EXISTS feature_items (
-    item_id         TEXT PRIMARY KEY,
-    parent_issue    INTEGER NOT NULL,
-    title           TEXT NOT NULL,
-    item_type       TEXT NOT NULL DEFAULT 'checkbox',
-    state           TEXT NOT NULL DEFAULT 'open',
-    linked_pr       INTEGER,
-    completed_at    TEXT,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
 CREATE TABLE IF NOT EXISTS poll_state (
     key     TEXT PRIMARY KEY,
     value   TEXT NOT NULL
@@ -84,15 +48,6 @@ CREATE TABLE IF NOT EXISTS detected_updates (
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS stall_alerts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    alert_type      TEXT NOT NULL,
-    ref_id          TEXT NOT NULL,
-    days_stalled    INTEGER NOT NULL,
-    alert_sent_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(alert_type, ref_id, days_stalled)
-);
-
 CREATE TABLE IF NOT EXISTS llm_usage (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     task_type   TEXT NOT NULL,
@@ -115,5 +70,35 @@ CREATE TABLE IF NOT EXISTS pr_classification (
     pr_number    INTEGER PRIMARY KEY,
     head_sha     TEXT NOT NULL,
     is_diffusion INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ci_retry_state (
+    pr_number   INTEGER NOT NULL,
+    head_sha    TEXT NOT NULL,
+    job_name    TEXT NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (pr_number, head_sha, job_name)
+);
+
+CREATE TABLE IF NOT EXISTS ci_snapshots (
+    pr_number       INTEGER NOT NULL,
+    head_sha        TEXT NOT NULL,
+    overall_status  TEXT NOT NULL DEFAULT 'unknown',
+    has_run_ci_label INTEGER NOT NULL DEFAULT 0,
+    failed_jobs     TEXT NOT NULL DEFAULT '[]',
+    review_state    TEXT NOT NULL DEFAULT 'none',
+    commit_count    INTEGER NOT NULL DEFAULT 0,
+    snapshot_data   TEXT NOT NULL DEFAULT '{}',
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (pr_number, head_sha)
+);
+
+CREATE TABLE IF NOT EXISTS tracked_pr_summaries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    pr_number   INTEGER NOT NULL,
+    summary     TEXT NOT NULL,
+    user_ids    TEXT NOT NULL DEFAULT '[]',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """

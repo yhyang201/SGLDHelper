@@ -43,21 +43,34 @@ class PRTracker:
         self._settings = settings
 
     def is_diffusion_pr(self, pr: dict[str, Any], files: list[dict[str, Any]] | None = None) -> bool:
-        """Check if a PR touches multimodal_gen diffusion code.
+        """Check if a PR is diffusion-related using multi-signal OR logic.
 
-        File-path matching is the source of truth. The ``diffusion`` label
-        alone is NOT sufficient because diffusion-llm PRs may carry the same
-        label.  If *files* have not been fetched yet the caller should pass
-        ``None``; the poll loop will then fetch them and retry.
+        Signals (any match → True):
+        1. Title contains "diffusion" but NOT "diffusion-llm" / "diffusion llm"
+        2. Label named "diffusion"
+        3. File paths match configured diffusion_paths prefixes
+
+        Title/label checks are cheap (no API call). File-path check requires
+        the *files* parameter; if ``None`` is passed, only title/label are used.
         """
-        if files is None:
-            # Without file information we cannot decide — return False so the
-            # caller knows it must fetch files and retry.
-            return False
-        return any(
-            f.get("filename", "").startswith(tuple(self._settings.diffusion_paths))
-            for f in files
-        )
+        # Signal 1: title
+        title = pr.get("title", "").lower()
+        if "diffusion" in title and "diffusion-llm" not in title and "diffusion llm" not in title:
+            return True
+
+        # Signal 2: labels
+        labels = [l["name"].lower() for l in pr.get("labels", [])]
+        if "diffusion" in labels:
+            return True
+
+        # Signal 3: file paths (most precise, requires files)
+        if files is not None:
+            return any(
+                f.get("filename", "").startswith(tuple(self._settings.diffusion_paths))
+                for f in files
+            )
+
+        return False
 
     async def poll(self) -> list[PRChange]:
         """Poll for PR changes and return detected events.
@@ -65,10 +78,19 @@ class PRTracker:
         Uses a classification cache to avoid calling ``get_pull_files`` for
         every open PR on each poll cycle.  Only new PRs or PRs whose
         ``head_sha`` changed since the last poll trigger a files lookup.
+
+        On cold start (empty classification cache), fetches up to
+        ``cold_start_max_prs`` PRs to seed the cache.
         """
         changes: list[PRChange] = []
-        pulls = await self._client.get_open_pulls()
         cache = await queries.get_pr_classifications(self._db.conn)
+
+        # Cold start: fetch more PRs when cache is empty
+        if not cache:
+            log.info("pr_tracker.cold_start", max_prs=self._settings.cold_start_max_prs)
+            pulls = await self._client.get_open_pulls_all(self._settings.cold_start_max_prs)
+        else:
+            pulls = await self._client.get_open_pulls()
 
         for pr_data in pulls:
             pr_num = pr_data["number"]
@@ -92,12 +114,15 @@ class PRTracker:
                         changes.extend(detected)
                     continue
 
-            # New PR or SHA changed — fetch files and (re-)classify.
-            try:
-                files = await self._client.get_pull_files(pr_num)
-            except Exception:
-                files = []
-            is_diff = self.is_diffusion_pr(pr_data, files)
+            # New PR or SHA changed — try title/label first (cheap), then files.
+            is_diff = self.is_diffusion_pr(pr_data)  # title/label only
+            if not is_diff:
+                # Title/label didn't match — fetch files for precise check.
+                try:
+                    files = await self._client.get_pull_files(pr_num)
+                except Exception:
+                    files = []
+                is_diff = self.is_diffusion_pr(pr_data, files)
             await queries.upsert_pr_classification(self._db.conn, pr_num, sha, is_diff)
 
             if not is_diff:

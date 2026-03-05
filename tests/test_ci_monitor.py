@@ -1,0 +1,193 @@
+"""Tests for CI monitor: job parsing, status aggregation, retry logic."""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock
+
+import pytest
+
+from sgldhelper.ci.monitor import CIMonitor, CIOverallStatus
+
+
+@pytest.fixture
+def mock_gh():
+    gh = AsyncMock()
+    gh.get_pull = AsyncMock(return_value={
+        "number": 19876,
+        "state": "open",
+        "head": {"sha": "abc123def456"},
+        "labels": [{"name": "run-ci"}],
+        "user": {"login": "alice"},
+        "title": "Test PR",
+        "updated_at": "2025-03-01T00:00:00Z",
+    })
+    gh.get_pull_reviews = AsyncMock(return_value=[])
+    gh.get_pull_commits = AsyncMock(return_value=[{"sha": "abc123"}])
+    gh.rerun_failed_jobs = AsyncMock()
+    gh.create_issue_comment = AsyncMock()
+    return gh
+
+
+@pytest.fixture
+def ci_monitor(mock_gh, db, settings):
+    return CIMonitor(mock_gh, db, settings)
+
+
+class TestCheckPrCI:
+    @pytest.mark.asyncio
+    async def test_no_ci_runs(self, ci_monitor, mock_gh):
+        """When no workflow runs exist, return NO_CI."""
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[])
+        status = await ci_monitor.check_pr_ci(19876, "abc123def456")
+        assert status.overall == CIOverallStatus.NO_CI
+        assert status.all_runs_completed is True
+
+    @pytest.mark.asyncio
+    async def test_all_passed(self, ci_monitor, mock_gh, settings):
+        """When all jobs succeed, return PASSED."""
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+            {
+                "id": 1,
+                "workflow_id": settings.ci_nvidia_workflow_id,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ])
+        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
+            {"name": "build", "status": "completed", "conclusion": "success", "id": 10},
+        ])
+        status = await ci_monitor.check_pr_ci(19876, "abc123def456")
+        assert status.overall == CIOverallStatus.PASSED
+        assert len(status.nvidia_jobs) == 1
+        assert status.all_runs_completed is True
+
+    @pytest.mark.asyncio
+    async def test_failed_jobs(self, ci_monitor, mock_gh, settings):
+        """When a job fails, return FAILED with failed_jobs populated."""
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+            {
+                "id": 1,
+                "workflow_id": settings.ci_nvidia_workflow_id,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ])
+        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
+            {"name": "test-gpu", "status": "completed", "conclusion": "failure", "id": 10},
+            {"name": "lint", "status": "completed", "conclusion": "success", "id": 11},
+        ])
+        status = await ci_monitor.check_pr_ci(19876, "abc123def456")
+        assert status.overall == CIOverallStatus.FAILED
+        assert len(status.failed_jobs) == 1
+        assert status.failed_jobs[0].job_name == "test-gpu"
+
+    @pytest.mark.asyncio
+    async def test_running_status(self, ci_monitor, mock_gh, settings):
+        """When runs are still in progress, return RUNNING."""
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+            {
+                "id": 1,
+                "workflow_id": settings.ci_nvidia_workflow_id,
+                "status": "in_progress",
+                "conclusion": None,
+            },
+        ])
+        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
+            {"name": "build", "status": "in_progress", "conclusion": None, "id": 10},
+        ])
+        status = await ci_monitor.check_pr_ci(19876, "abc123def456")
+        assert status.overall == CIOverallStatus.RUNNING
+        assert status.all_runs_completed is False
+
+    @pytest.mark.asyncio
+    async def test_skipped_jobs_filtered(self, ci_monitor, mock_gh, settings):
+        """Skipped jobs should be excluded from results."""
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+            {
+                "id": 1,
+                "workflow_id": settings.ci_nvidia_workflow_id,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ])
+        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
+            {"name": "build", "status": "completed", "conclusion": "success", "id": 10},
+            {"name": "optional", "status": "completed", "conclusion": "skipped", "id": 11},
+        ])
+        status = await ci_monitor.check_pr_ci(19876, "abc123def456")
+        assert len(status.nvidia_jobs) == 1
+        assert status.nvidia_jobs[0].job_name == "build"
+
+    @pytest.mark.asyncio
+    async def test_has_run_ci_label(self, ci_monitor, mock_gh):
+        """Should detect the run-ci label."""
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[])
+        status = await ci_monitor.check_pr_ci(19876, "abc123def456")
+        assert status.has_run_ci_label is True
+
+    @pytest.mark.asyncio
+    async def test_no_run_ci_label(self, ci_monitor, mock_gh):
+        """Should detect missing run-ci label."""
+        mock_gh.get_pull = AsyncMock(return_value={
+            "number": 19876,
+            "state": "open",
+            "head": {"sha": "abc123def456"},
+            "labels": [],
+            "user": {"login": "alice"},
+        })
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[])
+        status = await ci_monitor.check_pr_ci(19876, "abc123def456")
+        assert status.has_run_ci_label is False
+
+
+class TestRetryLogic:
+    @pytest.mark.asyncio
+    async def test_should_retry_under_limit(self, ci_monitor, mock_gh, settings):
+        """Should return True when retry count is under the limit."""
+        from sgldhelper.ci.monitor import CIJobResult
+        job = CIJobResult(
+            job_name="test-gpu", workflow_name="nvidia",
+            status="completed", conclusion="failure",
+            run_id=1, job_id=10,
+        )
+        assert await ci_monitor.should_retry(19876, "abc123", job) is True
+
+    @pytest.mark.asyncio
+    async def test_should_not_retry_at_limit(self, ci_monitor, db, settings):
+        """Should return False when retry count reaches the limit."""
+        from sgldhelper.ci.monitor import CIJobResult
+        from sgldhelper.db import queries
+
+        job = CIJobResult(
+            job_name="test-gpu", workflow_name="nvidia",
+            status="completed", conclusion="failure",
+            run_id=1, job_id=10,
+        )
+        # Exhaust retries
+        for _ in range(settings.ci_max_retries):
+            await queries.increment_ci_retry(db.conn, 19876, "abc123", "test-gpu")
+
+        assert await ci_monitor.should_retry(19876, "abc123", job) is False
+
+
+class TestTriggerCI:
+    @pytest.mark.asyncio
+    async def test_trigger_without_label(self, ci_monitor, mock_gh):
+        """Should post a comment when run-ci label is missing."""
+        await ci_monitor.trigger_ci(19876, has_label=False)
+        mock_gh.create_issue_comment.assert_called_once_with(19876, "/tag-and-rerun-ci")
+
+    @pytest.mark.asyncio
+    async def test_trigger_with_label(self, ci_monitor, mock_gh, settings):
+        """Should rerun failed jobs when run-ci label exists."""
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+            {
+                "id": 100,
+                "workflow_id": settings.ci_nvidia_workflow_id,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ])
+        await ci_monitor.trigger_ci(19876, has_label=True)
+        mock_gh.rerun_failed_jobs.assert_called_once_with(100)

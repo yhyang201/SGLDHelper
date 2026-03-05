@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import structlog
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from sgldhelper.config import Settings
+
+if TYPE_CHECKING:
+    import aiosqlite
 
 log = structlog.get_logger()
 
@@ -77,6 +80,35 @@ class SlackApp:
             thread_ts=thread_ts,
         )
         return result.data  # type: ignore[return-value]
+
+    async def post_message_with_context(
+        self,
+        channel: str,
+        *,
+        text: str,
+        blocks: list[dict[str, Any]] | None = None,
+        thread_ts: str | None = None,
+        db_conn: "aiosqlite.Connection | None" = None,
+    ) -> dict[str, Any]:
+        """Post a message and save it to conversation history.
+
+        When the bot posts proactively (health checks, CI notifications),
+        the message needs to be stored so that user replies in the thread
+        have context about what the bot said.
+        """
+        result = await self.post_message(
+            channel, text=text, blocks=blocks, thread_ts=thread_ts,
+        )
+        if db_conn is not None:
+            ts = result.get("ts", "")
+            # Use the thread_ts if replying, otherwise the new message ts
+            ctx_thread_ts = thread_ts or ts
+            from sgldhelper.db import queries
+            await queries.save_conversation_message(
+                db_conn, ctx_thread_ts, channel,
+                role="assistant", content=text,
+            )
+        return result
 
     async def update_message(
         self,

@@ -33,40 +33,14 @@ def mock_gh():
 
 
 @pytest.fixture
-def mock_rerunner():
-    rerunner = AsyncMock()
-    rerunner.manual_rerun = AsyncMock(return_value=[
-        MagicMock(run_id=100, triggered=True, reason="Manual rerun triggered"),
-    ])
-    return rerunner
-
-
-@pytest.fixture
-def mock_issue_tracker():
-    tracker = AsyncMock()
-    tracker.get_progress = AsyncMock(return_value=MagicMock(
-        issue_number=14199,
-        title="Diffusion Roadmap",
-        total=10,
-        completed=3,
-        percent=30.0,
-        items=[
-            {"title": "Add SDXL support", "state": "completed"},
-            {"title": "Add ControlNet", "state": "open"},
-        ],
-    ))
-    return tracker
-
-
-@pytest.fixture
-async def registry(db, mock_gh, mock_rerunner, mock_issue_tracker, settings):
-    return ToolRegistry(db, mock_gh, mock_rerunner, mock_issue_tracker, settings)
+async def registry(db, mock_gh, settings):
+    return ToolRegistry(db, mock_gh, settings)
 
 
 class TestToolSchemas:
     def test_schemas_are_valid(self, registry):
         schemas = registry.get_schemas()
-        assert len(schemas) == 16
+        assert len(schemas) == 15
 
         for schema in schemas:
             assert schema["type"] == "function"
@@ -79,24 +53,27 @@ class TestToolSchemas:
         schemas = registry.get_schemas()
         names = {s["function"]["name"] for s in schemas}
         expected = {
-            "get_open_prs", "get_pr_details", "get_ci_status",
-            "get_feature_progress", "get_feature_items", "get_pr_reviews",
-            "search_prs", "get_recent_activity", "get_stalled_features",
-            "rerun_ci", "get_my_preferences", "update_tracked_prs",
-            "save_user_note", "link_pr_to_feature", "get_unlinked_features",
-            "review_pr_code",
+            "get_open_prs", "get_pr_details",
+            "get_pr_reviews", "search_prs", "search_github_prs",
+            "get_recent_activity",
+            "get_my_preferences", "update_tracked_prs",
+            "save_user_note", "review_pr_code",
+            "get_ci_status", "trigger_ci", "cancel_auto_merge",
+            "merge_pr", "get_merge_ready_prs",
         }
         assert names == expected
 
 
 class TestToolConfirmation:
-    def test_rerun_ci_requires_confirmation(self, registry):
-        assert registry.needs_confirmation("rerun_ci") is True
-
     def test_read_tools_no_confirmation(self, registry):
         assert registry.needs_confirmation("get_open_prs") is False
         assert registry.needs_confirmation("get_pr_details") is False
         assert registry.needs_confirmation("get_ci_status") is False
+
+    def test_write_tools_need_confirmation(self, registry):
+        assert registry.needs_confirmation("trigger_ci") is False
+        assert registry.needs_confirmation("cancel_auto_merge") is True
+        assert registry.needs_confirmation("merge_pr") is True
 
     def test_unknown_tool_no_confirmation(self, registry):
         assert registry.needs_confirmation("nonexistent") is False
@@ -134,22 +111,6 @@ class TestToolExecution:
         assert result[0]["state"] == "APPROVED"
 
     @pytest.mark.asyncio
-    async def test_rerun_ci(self, registry, mock_rerunner):
-        result_str = await registry.execute("rerun_ci", '{"pr_number": 1234}')
-        result = json.loads(result_str)
-        assert result["pr_number"] == 1234
-        assert result["results"][0]["triggered"] is True
-        mock_rerunner.manual_rerun.assert_called_once_with(1234)
-
-    @pytest.mark.asyncio
-    async def test_get_feature_progress(self, registry, mock_issue_tracker):
-        result_str = await registry.execute("get_feature_progress", '{"issue_number": 14199}')
-        result = json.loads(result_str)
-        assert result["total"] == 10
-        assert result["completed"] == 3
-        assert result["percent"] == 30.0
-
-    @pytest.mark.asyncio
     async def test_unknown_tool(self, registry):
         result_str = await registry.execute("nonexistent_tool", "{}")
         result = json.loads(result_str)
@@ -179,77 +140,6 @@ class TestToolExecution:
         result_str = await registry.execute("get_pr_details", {"pr_number": 1234})
         result = json.loads(result_str)
         assert result["title"] == "Add diffusion model"
-
-
-class TestFeatureBinding:
-    @pytest.mark.asyncio
-    async def test_get_unlinked_features(self, registry, db):
-        from sgldhelper.db import queries
-        # One open+unlinked, one open+linked, one completed+unlinked
-        await queries.upsert_feature_item(db.conn, {
-            "item_id": "14199/1", "parent_issue": 14199, "title": "SDXL support",
-            "item_type": "checkbox", "state": "open", "linked_pr": None,
-        })
-        await queries.upsert_feature_item(db.conn, {
-            "item_id": "14199/2", "parent_issue": 14199, "title": "ControlNet",
-            "item_type": "checkbox", "state": "open", "linked_pr": 5678,
-        })
-        await queries.upsert_feature_item(db.conn, {
-            "item_id": "14199/3", "parent_issue": 14199, "title": "Done item",
-            "item_type": "checkbox", "state": "completed", "linked_pr": None,
-        })
-        result_str = await registry.execute("get_unlinked_features", "{}")
-        result = json.loads(result_str)
-        assert len(result) == 1
-        assert result[0]["item_id"] == "14199/1"
-
-    @pytest.mark.asyncio
-    async def test_link_pr_to_feature_success(self, registry, db):
-        from sgldhelper.db import queries
-        await queries.upsert_pr(db.conn, {
-            "pr_number": 9999, "title": "Impl SDXL", "author": "alice",
-            "state": "open", "head_sha": "aaa111", "updated_at": "2025-03-01",
-            "changed_files": 3,
-        })
-        await queries.upsert_feature_item(db.conn, {
-            "item_id": "14199/1", "parent_issue": 14199, "title": "SDXL support",
-            "item_type": "checkbox", "state": "open",
-        })
-        result_str = await registry.execute(
-            "link_pr_to_feature", '{"pr_number": 9999, "item_id": "14199/1"}'
-        )
-        result = json.loads(result_str)
-        assert result["success"] is True
-        assert result["linked_pr"] == 9999
-
-    @pytest.mark.asyncio
-    async def test_link_pr_to_feature_invalid_pr(self, registry, db):
-        from sgldhelper.db import queries
-        await queries.upsert_feature_item(db.conn, {
-            "item_id": "14199/1", "parent_issue": 14199, "title": "SDXL support",
-            "item_type": "checkbox", "state": "open",
-        })
-        result_str = await registry.execute(
-            "link_pr_to_feature", '{"pr_number": 77777, "item_id": "14199/1"}'
-        )
-        result = json.loads(result_str)
-        assert "error" in result
-        assert "not found" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_link_pr_to_feature_invalid_item(self, registry, db):
-        from sgldhelper.db import queries
-        await queries.upsert_pr(db.conn, {
-            "pr_number": 9999, "title": "Impl SDXL", "author": "alice",
-            "state": "open", "head_sha": "aaa111", "updated_at": "2025-03-01",
-            "changed_files": 3,
-        })
-        result_str = await registry.execute(
-            "link_pr_to_feature", '{"pr_number": 9999, "item_id": "nonexistent/99"}'
-        )
-        result = json.loads(result_str)
-        assert "error" in result
-        assert "not found" in result["error"]
 
 
 class TestCodeReview:
@@ -293,3 +183,175 @@ class TestCodeReview:
     @pytest.mark.asyncio
     async def test_review_pr_code_no_confirmation(self, registry):
         assert registry.needs_confirmation("review_pr_code") is False
+
+
+class TestCITools:
+    @pytest.mark.asyncio
+    async def test_get_ci_status_no_monitor(self, registry):
+        """get_ci_status returns error when CI monitor not set."""
+        result_str = await registry.execute("get_ci_status", '{"pr_number": 1234}')
+        result = json.loads(result_str)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_trigger_ci_no_monitor(self, registry):
+        result_str = await registry.execute("trigger_ci", '{"pr_number": 1234}')
+        result = json.loads(result_str)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_cancel_auto_merge_no_manager(self, registry):
+        result_str = await registry.execute("cancel_auto_merge", '{"pr_number": 1234}')
+        result = json.loads(result_str)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_search_github_prs(self, registry, mock_gh):
+        mock_gh.search_issues = AsyncMock(return_value=[
+            {
+                "number": 5555,
+                "title": "Fix diffusion interpolation bug",
+                "user": {"login": "bob"},
+                "state": "closed",
+                "labels": [{"name": "diffusion"}],
+                "updated_at": "2025-03-01T00:00:00Z",
+                "html_url": "https://github.com/sgl-project/sglang/pull/5555",
+            },
+        ])
+        result_str = await registry.execute(
+            "search_github_prs",
+            '{"keywords": ["diffusion", "interpolation", "fix"]}',
+        )
+        result = json.loads(result_str)
+        assert len(result) == 1
+        assert result[0]["pr_number"] == 5555
+        assert result[0]["title"] == "Fix diffusion interpolation bug"
+        mock_gh.search_issues.assert_called_once_with(
+            ["diffusion", "interpolation", "fix"],
+            is_pr=True, state=None, max_results=10,
+        )
+
+    @pytest.mark.asyncio
+    async def test_search_github_prs_with_state(self, registry, mock_gh):
+        mock_gh.search_issues = AsyncMock(return_value=[])
+        result_str = await registry.execute(
+            "search_github_prs",
+            '{"keywords": ["test"], "state": "open", "max_results": 5}',
+        )
+        result = json.loads(result_str)
+        assert result == []
+        mock_gh.search_issues.assert_called_once_with(
+            ["test"], is_pr=True, state="open", max_results=5,
+        )
+
+    @pytest.mark.asyncio
+    async def test_merge_pr(self, registry, mock_gh):
+        mock_gh.merge_pull = AsyncMock(return_value={"message": "Pull Request successfully merged"})
+        result_str = await registry.execute("merge_pr", '{"pr_number": 1234}')
+        result = json.loads(result_str)
+        assert result["merged"] is True
+        assert result["merge_method"] == "squash"
+        mock_gh.merge_pull.assert_called_once_with(1234, merge_method="squash")
+
+    @pytest.mark.asyncio
+    async def test_merge_pr_custom_method(self, registry, mock_gh):
+        mock_gh.merge_pull = AsyncMock(return_value={"message": "merged"})
+        result_str = await registry.execute("merge_pr", '{"pr_number": 1234, "merge_method": "rebase"}')
+        result = json.loads(result_str)
+        assert result["merge_method"] == "rebase"
+        mock_gh.merge_pull.assert_called_once_with(1234, merge_method="rebase")
+
+    @pytest.mark.asyncio
+    async def test_merge_pr_not_mergeable(self, registry, mock_gh):
+        mock_gh.merge_pull = AsyncMock(side_effect=Exception("405 Method Not Allowed"))
+        result_str = await registry.execute("merge_pr", '{"pr_number": 1234}')
+        result = json.loads(result_str)
+        assert "error" in result
+        assert "not mergeable" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_get_merge_ready_prs_empty(self, registry, db):
+        """Returns empty when no open PRs in DB."""
+        result_str = await registry.execute("get_merge_ready_prs", "{}")
+        result = json.loads(result_str)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_merge_ready_prs_finds_ready(self, registry, db, mock_gh, settings):
+        """Returns PRs that are open + mergeable + approved + CI passed."""
+        from sgldhelper.ci.monitor import CIMonitor, CIOverallStatus, CIStatus
+        from sgldhelper.db import queries
+
+        # Insert an open PR into DB
+        await queries.upsert_pr(db.conn, {
+            "pr_number": 9999, "title": "Ready PR", "author": "alice",
+            "state": "open", "head_sha": "aaa111", "updated_at": "2025-03-01",
+            "changed_files": 3,
+        })
+
+        # Mock GitHub responses
+        mock_gh.get_pull = AsyncMock(return_value={
+            "number": 9999, "title": "Ready PR", "state": "open",
+            "mergeable": True, "head": {"sha": "aaa111"},
+            "user": {"login": "alice"}, "labels": [{"name": "run-ci"}],
+            "html_url": "https://github.com/sgl-project/sglang/pull/9999",
+            "updated_at": "2025-03-01",
+        })
+        mock_gh.get_pull_reviews = AsyncMock(return_value=[
+            {"user": {"login": "bob"}, "state": "APPROVED"},
+        ])
+
+        ci_monitor = AsyncMock()
+        ci_monitor.check_pr_ci = AsyncMock(return_value=CIStatus(
+            pr_number=9999, head_sha="aaa111",
+            overall=CIOverallStatus.PASSED, has_run_ci_label=True,
+            all_runs_completed=True,
+        ))
+        registry.set_ci_components(ci_monitor, None)
+
+        result_str = await registry.execute("get_merge_ready_prs", "{}")
+        result = json.loads(result_str)
+        assert len(result) == 1
+        assert result[0]["pr_number"] == 9999
+
+    @pytest.mark.asyncio
+    async def test_get_merge_ready_prs_skips_unapproved(self, registry, db, mock_gh, settings):
+        """Skips PRs without approval."""
+        from sgldhelper.db import queries
+
+        await queries.upsert_pr(db.conn, {
+            "pr_number": 8888, "title": "No approval", "author": "bob",
+            "state": "open", "head_sha": "bbb222", "updated_at": "2025-03-01",
+            "changed_files": 1,
+        })
+        mock_gh.get_pull = AsyncMock(return_value={
+            "number": 8888, "title": "No approval", "state": "open",
+            "mergeable": True, "head": {"sha": "bbb222"},
+            "user": {"login": "bob"}, "labels": [],
+            "updated_at": "2025-03-01",
+        })
+        mock_gh.get_pull_reviews = AsyncMock(return_value=[])
+
+        result_str = await registry.execute("get_merge_ready_prs", "{}")
+        result = json.loads(result_str)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_ci_status_with_monitor(self, registry, mock_gh, settings):
+        from sgldhelper.ci.monitor import CIMonitor, CIOverallStatus, CIStatus
+        ci_monitor = AsyncMock()
+        ci_monitor.check_pr_ci = AsyncMock(return_value=CIStatus(
+            pr_number=1234,
+            head_sha="abc12345",
+            overall=CIOverallStatus.PASSED,
+            has_run_ci_label=True,
+            nvidia_jobs=[],
+            amd_jobs=[],
+            failed_jobs=[],
+            all_runs_completed=True,
+        ))
+        registry.set_ci_components(ci_monitor, None)
+        result_str = await registry.execute("get_ci_status", '{"pr_number": 1234}')
+        result = json.loads(result_str)
+        assert result["overall"] == "passed"
+        assert result["has_run_ci_label"] is True

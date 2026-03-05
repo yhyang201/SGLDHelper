@@ -102,164 +102,6 @@ async def get_open_prs(conn: aiosqlite.Connection) -> list[dict[str, Any]]:
     return [dict(r) for r in await cur.fetchall()]
 
 
-# ---------------------------------------------------------------------------
-# CI runs
-# ---------------------------------------------------------------------------
-
-async def upsert_ci_run(conn: aiosqlite.Connection, run: dict[str, Any]) -> dict[str, Any] | None:
-    cur = await conn.execute(
-        "SELECT * FROM ci_runs WHERE run_id = ?", (run["run_id"],)
-    )
-    old = await cur.fetchone()
-    old_dict = dict(old) if old else None
-
-    await conn.execute(
-        """INSERT INTO ci_runs
-            (run_id, pr_number, job_name, head_sha, status, conclusion,
-             failure_category, failure_summary, auto_rerun_count, html_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(run_id) DO UPDATE SET
-            status = excluded.status,
-            conclusion = excluded.conclusion,
-            failure_category = excluded.failure_category,
-            failure_summary = excluded.failure_summary,
-            auto_rerun_count = excluded.auto_rerun_count,
-            html_url = excluded.html_url
-        """,
-        (
-            run["run_id"],
-            run["pr_number"],
-            run["job_name"],
-            run["head_sha"],
-            run["status"],
-            run.get("conclusion"),
-            run.get("failure_category"),
-            run.get("failure_summary"),
-            run.get("auto_rerun_count", 0),
-            run.get("html_url"),
-        ),
-    )
-    await conn.commit()
-    return old_dict
-
-
-async def get_ci_run(conn: aiosqlite.Connection, run_id: int) -> dict[str, Any] | None:
-    cur = await conn.execute("SELECT * FROM ci_runs WHERE run_id = ?", (run_id,))
-    row = await cur.fetchone()
-    return dict(row) if row else None
-
-
-async def get_ci_runs_for_pr(
-    conn: aiosqlite.Connection, pr_number: int
-) -> list[dict[str, Any]]:
-    cur = await conn.execute(
-        "SELECT * FROM ci_runs WHERE pr_number = ? ORDER BY created_at DESC",
-        (pr_number,),
-    )
-    return [dict(r) for r in await cur.fetchall()]
-
-
-async def increment_rerun_count(conn: aiosqlite.Connection, run_id: int) -> None:
-    await conn.execute(
-        "UPDATE ci_runs SET auto_rerun_count = auto_rerun_count + 1 WHERE run_id = ?",
-        (run_id,),
-    )
-    await conn.commit()
-
-
-async def log_rerun(
-    conn: aiosqlite.Connection,
-    run_id: int,
-    new_run_id: int | None,
-    triggered_by: str,
-    reason: str,
-) -> None:
-    await conn.execute(
-        "INSERT INTO ci_rerun_log (run_id, new_run_id, triggered_by, reason) VALUES (?, ?, ?, ?)",
-        (run_id, new_run_id, triggered_by, reason),
-    )
-    await conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# Feature items
-# ---------------------------------------------------------------------------
-
-async def upsert_feature_item(conn: aiosqlite.Connection, item: dict[str, Any]) -> dict[str, Any] | None:
-    cur = await conn.execute(
-        "SELECT * FROM feature_items WHERE item_id = ?", (item["item_id"],)
-    )
-    old = await cur.fetchone()
-    old_dict = dict(old) if old else None
-
-    await conn.execute(
-        """INSERT INTO feature_items
-            (item_id, parent_issue, title, item_type, state, linked_pr, completed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(item_id) DO UPDATE SET
-            title = excluded.title,
-            state = excluded.state,
-            linked_pr = excluded.linked_pr,
-            completed_at = excluded.completed_at
-        """,
-        (
-            item["item_id"],
-            item["parent_issue"],
-            item["title"],
-            item.get("item_type", "checkbox"),
-            item["state"],
-            item.get("linked_pr"),
-            item.get("completed_at"),
-        ),
-    )
-    await conn.commit()
-    return old_dict
-
-
-async def get_feature_items(
-    conn: aiosqlite.Connection, parent_issue: int
-) -> list[dict[str, Any]]:
-    cur = await conn.execute(
-        "SELECT * FROM feature_items WHERE parent_issue = ? ORDER BY item_id",
-        (parent_issue,),
-    )
-    return [dict(r) for r in await cur.fetchall()]
-
-
-async def get_feature_summary(
-    conn: aiosqlite.Connection, parent_issue: int
-) -> dict[str, int]:
-    cur = await conn.execute(
-        "SELECT state, COUNT(*) as cnt FROM feature_items WHERE parent_issue = ? GROUP BY state",
-        (parent_issue,),
-    )
-    rows = await cur.fetchall()
-    result: dict[str, int] = {}
-    for r in rows:
-        result[r["state"]] = r["cnt"]
-    return result
-
-
-async def update_feature_linked_pr(
-    conn: aiosqlite.Connection, item_id: str, pr_number: int
-) -> bool:
-    """Link a PR to a feature item. Returns True if the row was updated."""
-    cur = await conn.execute(
-        "UPDATE feature_items SET linked_pr = ? WHERE item_id = ?",
-        (pr_number, item_id),
-    )
-    await conn.commit()
-    return cur.rowcount > 0
-
-
-async def get_unlinked_features(conn: aiosqlite.Connection) -> list[dict[str, Any]]:
-    """Return open feature items that have no linked PR."""
-    cur = await conn.execute(
-        "SELECT * FROM feature_items WHERE linked_pr IS NULL AND state = 'open' ORDER BY parent_issue, item_id"
-    )
-    return [dict(r) for r in await cur.fetchall()]
-
-
 async def get_users_tracking_pr(conn: aiosqlite.Connection, pr_number: int) -> list[str]:
     """Return user IDs whose tracked_prs list contains *pr_number*."""
     cur = await conn.execute("SELECT user_id, tracked_prs FROM user_memories")
@@ -374,29 +216,6 @@ async def get_confirmed_blockers(
 
 
 # ---------------------------------------------------------------------------
-# Stall alerts (dedup)
-# ---------------------------------------------------------------------------
-
-async def record_stall_alert(
-    conn: aiosqlite.Connection,
-    alert_type: str,
-    ref_id: str,
-    days_stalled: int,
-) -> bool:
-    """Record a stall alert. Returns True if new (not a duplicate)."""
-    try:
-        await conn.execute(
-            "INSERT INTO stall_alerts (alert_type, ref_id, days_stalled) VALUES (?, ?, ?)",
-            (alert_type, ref_id, days_stalled),
-        )
-        await conn.commit()
-        return True
-    except Exception:
-        # UNIQUE constraint violation → duplicate
-        return False
-
-
-# ---------------------------------------------------------------------------
 # LLM usage tracking
 # ---------------------------------------------------------------------------
 
@@ -448,7 +267,7 @@ async def search_prs(
 async def get_recent_activity(
     conn: aiosqlite.Connection, since_hours: int = 24
 ) -> dict[str, Any]:
-    """Aggregate recent PR/CI/feature activity for standup summaries."""
+    """Aggregate recent PR activity for standup summaries."""
     prs_cur = await conn.execute(
         """SELECT * FROM pull_requests
         WHERE updated_at >= datetime('now', ?)
@@ -457,60 +276,7 @@ async def get_recent_activity(
     )
     prs = [dict(r) for r in await prs_cur.fetchall()]
 
-    ci_cur = await conn.execute(
-        """SELECT * FROM ci_runs
-        WHERE created_at >= datetime('now', ?)
-        ORDER BY created_at DESC""",
-        (f"-{since_hours} hours",),
-    )
-    ci_runs = [dict(r) for r in await ci_cur.fetchall()]
-
-    feature_cur = await conn.execute(
-        "SELECT * FROM feature_items WHERE state = 'open' ORDER BY parent_issue, item_id"
-    )
-    open_features = [dict(r) for r in await feature_cur.fetchall()]
-
-    return {"prs": prs, "ci_runs": ci_runs, "open_features": open_features}
-
-
-async def get_stalled_features(
-    conn: aiosqlite.Connection, stall_days: int = 3
-) -> list[dict[str, Any]]:
-    """Find open feature items with linked PRs that haven't been updated recently."""
-    cur = await conn.execute(
-        """SELECT fi.*, pr.updated_at as pr_updated_at, pr.title as pr_title, pr.author as pr_author
-        FROM feature_items fi
-        JOIN pull_requests pr ON fi.linked_pr = pr.pr_number
-        WHERE fi.state = 'open'
-          AND pr.state = 'open'
-          AND pr.updated_at < datetime('now', ?)
-        ORDER BY pr.updated_at ASC""",
-        (f"-{stall_days} days",),
-    )
-    return [dict(r) for r in await cur.fetchall()]
-
-
-async def get_prs_needing_review(
-    conn: aiosqlite.Connection, review_days: int = 2
-) -> list[dict[str, Any]]:
-    """Find open PRs that haven't been updated in N days (likely need review)."""
-    cur = await conn.execute(
-        """SELECT * FROM pull_requests
-        WHERE state = 'open'
-          AND updated_at < datetime('now', ?)
-        ORDER BY updated_at ASC""",
-        (f"-{review_days} days",),
-    )
-    return [dict(r) for r in await cur.fetchall()]
-
-
-async def get_all_feature_items(
-    conn: aiosqlite.Connection,
-) -> list[dict[str, Any]]:
-    cur = await conn.execute(
-        "SELECT * FROM feature_items ORDER BY parent_issue, item_id"
-    )
-    return [dict(r) for r in await cur.fetchall()]
+    return {"prs": prs}
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +373,40 @@ async def save_user_note(conn: aiosqlite.Connection, user_id: str, note: str) ->
 # PR classification cache (diffusion detection)
 # ---------------------------------------------------------------------------
 
+async def get_diffusion_pr_summary(
+    conn: aiosqlite.Connection, since_hours: int = 2
+) -> dict[str, list[dict[str, Any]]]:
+    """Return diffusion PRs grouped by recent activity: new open, merged, closed."""
+    interval = f"-{since_hours} hours"
+
+    # Diffusion PRs are those stored in pull_requests (only diffusion PRs are upserted)
+    cur_open = await conn.execute(
+        """SELECT * FROM pull_requests
+        WHERE state = 'open' AND created_at >= datetime('now', ?)
+        ORDER BY pr_number DESC""",
+        (interval,),
+    )
+    newly_opened = [dict(r) for r in await cur_open.fetchall()]
+
+    cur_merged = await conn.execute(
+        """SELECT * FROM pull_requests
+        WHERE state = 'merged' AND updated_at >= datetime('now', ?)
+        ORDER BY pr_number DESC""",
+        (interval,),
+    )
+    merged = [dict(r) for r in await cur_merged.fetchall()]
+
+    cur_closed = await conn.execute(
+        """SELECT * FROM pull_requests
+        WHERE state = 'closed' AND updated_at >= datetime('now', ?)
+        ORDER BY pr_number DESC""",
+        (interval,),
+    )
+    closed = [dict(r) for r in await cur_closed.fetchall()]
+
+    return {"opened": newly_opened, "merged": merged, "closed": closed}
+
+
 async def get_pr_classifications(conn: aiosqlite.Connection) -> dict[int, tuple[str, bool]]:
     """Return {pr_number: (head_sha, is_diffusion)} for all cached entries."""
     cur = await conn.execute("SELECT pr_number, head_sha, is_diffusion FROM pr_classification")
@@ -624,3 +424,164 @@ async def upsert_pr_classification(
         (pr_number, head_sha, int(is_diffusion)),
     )
     await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# CI retry state
+# ---------------------------------------------------------------------------
+
+async def get_ci_retry_count(
+    conn: aiosqlite.Connection, pr_number: int, head_sha: str, job_name: str
+) -> int:
+    cur = await conn.execute(
+        "SELECT retry_count FROM ci_retry_state WHERE pr_number = ? AND head_sha = ? AND job_name = ?",
+        (pr_number, head_sha, job_name),
+    )
+    row = await cur.fetchone()
+    return row["retry_count"] if row else 0
+
+
+async def increment_ci_retry(
+    conn: aiosqlite.Connection, pr_number: int, head_sha: str, job_name: str
+) -> int:
+    """Increment retry count and return the new value."""
+    await conn.execute(
+        """INSERT INTO ci_retry_state (pr_number, head_sha, job_name, retry_count)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(pr_number, head_sha, job_name) DO UPDATE SET
+            retry_count = ci_retry_state.retry_count + 1,
+            updated_at = datetime('now')""",
+        (pr_number, head_sha, job_name),
+    )
+    await conn.commit()
+    return await get_ci_retry_count(conn, pr_number, head_sha, job_name)
+
+
+async def reset_ci_retries(
+    conn: aiosqlite.Connection, pr_number: int, head_sha: str
+) -> None:
+    await conn.execute(
+        "DELETE FROM ci_retry_state WHERE pr_number = ? AND head_sha = ?",
+        (pr_number, head_sha),
+    )
+    await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# CI snapshots
+# ---------------------------------------------------------------------------
+
+async def upsert_ci_snapshot(
+    conn: aiosqlite.Connection,
+    pr_number: int,
+    head_sha: str,
+    *,
+    overall_status: str = "unknown",
+    has_run_ci_label: bool = False,
+    failed_jobs: str = "[]",
+    review_state: str = "none",
+    commit_count: int = 0,
+    snapshot_data: str = "{}",
+) -> None:
+    await conn.execute(
+        """INSERT INTO ci_snapshots
+            (pr_number, head_sha, overall_status, has_run_ci_label,
+             failed_jobs, review_state, commit_count, snapshot_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(pr_number, head_sha) DO UPDATE SET
+            overall_status = excluded.overall_status,
+            has_run_ci_label = excluded.has_run_ci_label,
+            failed_jobs = excluded.failed_jobs,
+            review_state = excluded.review_state,
+            commit_count = excluded.commit_count,
+            snapshot_data = excluded.snapshot_data,
+            updated_at = datetime('now')""",
+        (pr_number, head_sha, overall_status, int(has_run_ci_label),
+         failed_jobs, review_state, commit_count, snapshot_data),
+    )
+    await conn.commit()
+
+
+async def get_ci_snapshot(
+    conn: aiosqlite.Connection, pr_number: int, head_sha: str
+) -> dict[str, Any] | None:
+    cur = await conn.execute(
+        "SELECT * FROM ci_snapshots WHERE pr_number = ? AND head_sha = ?",
+        (pr_number, head_sha),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def get_latest_ci_snapshot(
+    conn: aiosqlite.Connection, pr_number: int
+) -> dict[str, Any] | None:
+    """Get the most recent snapshot for a PR regardless of SHA."""
+    cur = await conn.execute(
+        "SELECT * FROM ci_snapshots WHERE pr_number = ? ORDER BY updated_at DESC LIMIT 1",
+        (pr_number,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Tracked PR summaries
+# ---------------------------------------------------------------------------
+
+async def save_tracked_pr_summary(
+    conn: aiosqlite.Connection, pr_number: int, summary: str, user_ids: list[str]
+) -> None:
+    await conn.execute(
+        "INSERT INTO tracked_pr_summaries (pr_number, summary, user_ids) VALUES (?, ?, ?)",
+        (pr_number, summary, json.dumps(user_ids)),
+    )
+    await conn.commit()
+
+
+async def get_last_tracked_pr_summary(
+    conn: aiosqlite.Connection, pr_number: int
+) -> dict[str, Any] | None:
+    cur = await conn.execute(
+        "SELECT * FROM tracked_pr_summaries WHERE pr_number = ? ORDER BY id DESC LIMIT 1",
+        (pr_number,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Tracked PR helpers (cross-user)
+# ---------------------------------------------------------------------------
+
+async def get_all_tracked_prs(conn: aiosqlite.Connection) -> dict[int, list[str]]:
+    """Return {pr_number: [user_ids]} for all tracked PRs across all users."""
+    cur = await conn.execute("SELECT user_id, tracked_prs FROM user_memories")
+    rows = await cur.fetchall()
+    result: dict[int, list[str]] = {}
+    for row in rows:
+        tracked = json.loads(row["tracked_prs"])
+        for pr_num in tracked:
+            result.setdefault(pr_num, []).append(row["user_id"])
+    return result
+
+
+async def remove_tracked_pr_all_users(
+    conn: aiosqlite.Connection, pr_number: int
+) -> list[str]:
+    """Remove a PR from all users' tracked lists. Returns affected user IDs."""
+    cur = await conn.execute("SELECT user_id, tracked_prs FROM user_memories")
+    rows = await cur.fetchall()
+    affected: list[str] = []
+    for row in rows:
+        tracked = json.loads(row["tracked_prs"])
+        if pr_number in tracked:
+            tracked = [p for p in tracked if p != pr_number]
+            await conn.execute(
+                "UPDATE user_memories SET tracked_prs = ?, updated_at = datetime('now') WHERE user_id = ?",
+                (json.dumps(tracked), row["user_id"]),
+            )
+            affected.append(row["user_id"])
+    if affected:
+        await conn.commit()
+    return affected
