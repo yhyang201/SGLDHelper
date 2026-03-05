@@ -46,6 +46,7 @@ class CIStatus:
     amd_jobs: list[CIJobResult] = field(default_factory=list)
     failed_jobs: list[CIJobResult] = field(default_factory=list)
     all_runs_completed: bool = False
+    has_high_priority_label: bool = False
 
 
 class CIMonitor:
@@ -65,6 +66,7 @@ class CIMonitor:
         self._on_ci_passed: Any = None
         self._on_ci_failed_retrying: Any = None
         self._on_ci_failed_permanent: Any = None
+        self._on_high_priority_nvidia_passed: Any = None
 
     def set_callbacks(
         self,
@@ -73,11 +75,13 @@ class CIMonitor:
         on_ci_failed_retrying: Any = None,
         on_ci_failed_permanent: Any = None,
         on_merge_ready_check: Any = None,
+        on_high_priority_nvidia_passed: Any = None,
     ) -> None:
         self._on_ci_passed = on_ci_passed
         self._on_ci_failed_retrying = on_ci_failed_retrying
         self._on_ci_failed_permanent = on_ci_failed_permanent
         self._on_merge_ready_check = on_merge_ready_check
+        self._on_high_priority_nvidia_passed = on_high_priority_nvidia_passed
 
     async def check_pr_ci(
         self,
@@ -95,6 +99,7 @@ class CIMonitor:
             pr_data = await self._gh.get_pull(pr_number)
         labels = [l["name"].lower() for l in pr_data.get("labels", [])]
         has_run_ci = "run-ci" in labels
+        has_high_priority = self._settings.ci_high_priority_label.lower() in labels
 
         # Get workflow runs for this SHA
         runs = await self._gh.get_workflow_runs_for_ref(head_sha)
@@ -146,6 +151,7 @@ class CIMonitor:
                 overall=CIOverallStatus.NO_CI,
                 has_run_ci_label=has_run_ci,
                 all_runs_completed=True,
+                has_high_priority_label=has_high_priority,
             )
 
         # Determine overall status
@@ -171,16 +177,36 @@ class CIMonitor:
             amd_jobs=amd_jobs,
             failed_jobs=failed,
             all_runs_completed=all_completed,
+            has_high_priority_label=has_high_priority,
+        )
+
+    def _nvidia_ci_passed(self, ci_status: CIStatus) -> bool:
+        """Check if all Nvidia CI jobs passed (ignores AMD)."""
+        if not ci_status.nvidia_jobs:
+            return False
+        return all(
+            j.status == "completed" and j.conclusion == "success"
+            for j in ci_status.nvidia_jobs
         )
 
     async def should_retry(
-        self, pr_number: int, head_sha: str, job: CIJobResult
+        self,
+        pr_number: int,
+        head_sha: str,
+        job: CIJobResult,
+        *,
+        is_high_priority: bool = False,
     ) -> bool:
         """Check if a failed job should be retried (under max retries)."""
         count = await queries.get_ci_retry_count(
             self._db.conn, pr_number, head_sha, job.job_name
         )
-        return count < self._settings.ci_max_retries
+        max_retries = (
+            self._settings.ci_high_priority_max_retries
+            if is_high_priority
+            else self._settings.ci_max_retries
+        )
+        return count < max_retries
 
     async def trigger_ci(self, pr_number: int, has_label: bool) -> None:
         """Trigger CI by adding run-ci label comment. Uses lock to prevent concurrent triggers."""
@@ -262,6 +288,35 @@ class CIMonitor:
             commit_count=commit_count,
         )
 
+        # --- High-priority: Nvidia passed + approved → ping (once) ---
+        if (
+            ci_status.has_high_priority_label
+            and self._nvidia_ci_passed(ci_status)
+            and review_state == "approved"
+            and self._on_high_priority_nvidia_passed
+        ):
+            # Check snapshot_data to avoid duplicate pings
+            snapshot_data: dict[str, Any] = {}
+            if prev_snapshot and prev_snapshot.get("snapshot_data"):
+                try:
+                    snapshot_data = json.loads(prev_snapshot["snapshot_data"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if not snapshot_data.get("hp_nvidia_pinged"):
+                await self._on_high_priority_nvidia_passed(pr_number, user_ids, review_state)
+                snapshot_data["hp_nvidia_pinged"] = True
+                await queries.upsert_ci_snapshot(
+                    self._db.conn,
+                    pr_number,
+                    head_sha,
+                    overall_status=ci_status.overall.value,
+                    has_run_ci_label=ci_status.has_run_ci_label,
+                    failed_jobs=json.dumps(failed_names),
+                    review_state=review_state,
+                    commit_count=commit_count,
+                    snapshot_data=json.dumps(snapshot_data),
+                )
+
         # --- Merge-ready check: runs EVERY poll when CI is PASSED ---
         # This catches: approve came after CI passed, PR became mergeable
         # after conflicts resolved, PR tracked when already CI-passed, etc.
@@ -285,7 +340,10 @@ class CIMonitor:
             permanent: list[CIJobResult] = []
 
             for job in ci_status.failed_jobs:
-                if await self.should_retry(pr_number, head_sha, job):
+                if await self.should_retry(
+                    pr_number, head_sha, job,
+                    is_high_priority=ci_status.has_high_priority_label,
+                ):
                     retryable.append(job)
                 else:
                     permanent.append(job)

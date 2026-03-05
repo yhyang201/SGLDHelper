@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from sgldhelper.ci.monitor import CIMonitor, CIOverallStatus
+from sgldhelper.ci.monitor import CIMonitor, CIJobResult, CIStatus, CIOverallStatus
 
 
 @pytest.fixture
@@ -191,3 +191,135 @@ class TestTriggerCI:
         ])
         await ci_monitor.trigger_ci(19876, has_label=True)
         mock_gh.rerun_failed_jobs.assert_called_once_with(100)
+
+
+class TestHighPriority:
+    @pytest.mark.asyncio
+    async def test_high_priority_label_detected(self, ci_monitor, mock_gh, settings):
+        """Should detect the high-priority label on a PR."""
+        mock_gh.get_pull = AsyncMock(return_value={
+            "number": 19876,
+            "state": "open",
+            "head": {"sha": "abc123def456"},
+            "labels": [{"name": "run-ci"}, {"name": "high-priority"}],
+            "user": {"login": "alice"},
+        })
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[])
+        status = await ci_monitor.check_pr_ci(19876, "abc123def456")
+        assert status.has_high_priority_label is True
+
+    @pytest.mark.asyncio
+    async def test_should_retry_high_priority_limit(self, ci_monitor, db, settings):
+        """High-priority PRs should retry up to 10 times, normal up to 3."""
+        from sgldhelper.db import queries
+
+        job = CIJobResult(
+            job_name="test-gpu", workflow_name="nvidia",
+            status="completed", conclusion="failure",
+            run_id=1, job_id=10,
+        )
+        # After 3 retries: normal=False, high-priority=True
+        for _ in range(settings.ci_max_retries):
+            await queries.increment_ci_retry(db.conn, 19876, "abc123", "test-gpu")
+
+        assert await ci_monitor.should_retry(19876, "abc123", job, is_high_priority=False) is False
+        assert await ci_monitor.should_retry(19876, "abc123", job, is_high_priority=True) is True
+
+        # After 10 retries: both False
+        for _ in range(settings.ci_high_priority_max_retries - settings.ci_max_retries):
+            await queries.increment_ci_retry(db.conn, 19876, "abc123", "test-gpu")
+
+        assert await ci_monitor.should_retry(19876, "abc123", job, is_high_priority=True) is False
+
+    @pytest.mark.asyncio
+    async def test_nvidia_ci_passed_helper(self, ci_monitor):
+        """_nvidia_ci_passed returns True when all nvidia jobs pass, even if AMD fails."""
+        ci_status = CIStatus(
+            pr_number=19876,
+            head_sha="abc123",
+            overall=CIOverallStatus.FAILED,
+            has_run_ci_label=True,
+            nvidia_jobs=[
+                CIJobResult("build", "nvidia", "completed", "success", 1, 10),
+                CIJobResult("test", "nvidia", "completed", "success", 1, 11),
+            ],
+            amd_jobs=[
+                CIJobResult("build", "amd", "completed", "failure", 2, 20),
+            ],
+            failed_jobs=[
+                CIJobResult("build", "amd", "completed", "failure", 2, 20),
+            ],
+        )
+        assert ci_monitor._nvidia_ci_passed(ci_status) is True
+
+    @pytest.mark.asyncio
+    async def test_high_priority_github_ping_triggered(self, ci_monitor, mock_gh, db, settings):
+        """Should trigger callback when nvidia passed + approved + high-priority."""
+        # Set up PR with high-priority label
+        mock_gh.get_pull = AsyncMock(return_value={
+            "number": 19876,
+            "state": "open",
+            "head": {"sha": "abc123def456"},
+            "labels": [{"name": "run-ci"}, {"name": "high-priority"}],
+            "user": {"login": "alice"},
+        })
+        # Nvidia CI passed
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+            {
+                "id": 1,
+                "workflow_id": settings.ci_nvidia_workflow_id,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ])
+        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
+            {"name": "build", "status": "completed", "conclusion": "success", "id": 10},
+        ])
+        # Approved
+        mock_gh.get_pull_reviews = AsyncMock(return_value=[
+            {"state": "APPROVED", "user": {"login": "reviewer"}},
+        ])
+        mock_gh.get_pull_commits = AsyncMock(return_value=[{"sha": "abc123def456"}])
+
+        hp_callback = AsyncMock()
+        ci_monitor.set_callbacks(on_high_priority_nvidia_passed=hp_callback)
+
+        await ci_monitor._poll_single_pr(19876, ["U123"])
+        hp_callback.assert_called_once_with(19876, ["U123"], "approved")
+
+    @pytest.mark.asyncio
+    async def test_high_priority_no_duplicate_ping(self, ci_monitor, mock_gh, db, settings):
+        """Should NOT ping a second time on the next poll for the same SHA."""
+        mock_gh.get_pull = AsyncMock(return_value={
+            "number": 19876,
+            "state": "open",
+            "head": {"sha": "abc123def456"},
+            "labels": [{"name": "run-ci"}, {"name": "high-priority"}],
+            "user": {"login": "alice"},
+        })
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+            {
+                "id": 1,
+                "workflow_id": settings.ci_nvidia_workflow_id,
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ])
+        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
+            {"name": "build", "status": "completed", "conclusion": "success", "id": 10},
+        ])
+        mock_gh.get_pull_reviews = AsyncMock(return_value=[
+            {"state": "APPROVED", "user": {"login": "reviewer"}},
+        ])
+        mock_gh.get_pull_commits = AsyncMock(return_value=[{"sha": "abc123def456"}])
+
+        hp_callback = AsyncMock()
+        ci_monitor.set_callbacks(on_high_priority_nvidia_passed=hp_callback)
+
+        # First poll — should ping
+        await ci_monitor._poll_single_pr(19876, ["U123"])
+        assert hp_callback.call_count == 1
+
+        # Second poll — should NOT ping again
+        await ci_monitor._poll_single_pr(19876, ["U123"])
+        assert hp_callback.call_count == 1

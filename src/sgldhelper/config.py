@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # CI monitoring
     ci_poll_interval: int = 300
     ci_max_retries: int = 3
+    ci_high_priority_max_retries: int = 10
+    ci_high_priority_label: str = "high-priority"
+    ci_high_priority_ping_user: str = "mickqian"
     ci_nvidia_workflow_id: int = 115218617
     ci_amd_workflow_id: int = 119055250
 
