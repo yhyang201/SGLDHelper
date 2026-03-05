@@ -1,177 +1,178 @@
 # SGLDHelper
 
-Automated operations assistant for the SGLang Diffusion subsystem, integrating Slack, GitHub, and AI (Kimi K2.5):
+Automated operations assistant for the SGLang Diffusion subsystem, integrating Slack, GitHub, and AI (Kimi K2.5).
 
-- Polls GitHub to monitor Diffusion-related PRs and CI runs
-- Pushes notifications to Slack channels
-- Automatically classifies CI failures (flaky / infra / code) and auto-reruns
-- `@bot` natural language queries answered via Kimi K2.5 + function calling
-- Passively listens to messages, detects progress updates and blockers
-- Alerts on PRs missing review
-- `/diffusion-standup` daily summary generation
+## What It Does
+
+- **PR Monitoring** — Polls GitHub for Diffusion-related PRs, pushes open/update/merge/close notifications to Slack
+- **CI Monitoring** — Tracks Nvidia + AMD CI workflows, auto-retries failed jobs, supports high-priority PR escalation
+- **Auto Merge** — CI passed + approved + tracked PR → countdown → squash merge (cancellable via Slack)
+- **Health Check** — Periodic report of all open Diffusion PRs: merge-ready, needs-review, CI-stalled
+- **AI Chat** — Natural language queries via Kimi K2.5 + 16 function-calling tools
+- **Passive Classification** — Detects progress updates and blockers from channel messages
+- **Tracked PR Summaries** — Per-user PR tracking with periodic AI-generated status updates
+- **Standup Generation** — `/diffusion-standup` slash command for daily summaries
 
 ## Prerequisites
 
-You need four sets of credentials:
-
 | Credential | Where to get it |
 |------------|-----------------|
-| **GitHub Token** | GitHub Settings → Developer settings → Personal access tokens (needs `repo` scope) |
-| **Slack Bot Token** (`xoxb-`) | Slack API → Create App → OAuth & Permissions → Install to Workspace |
-| **Slack App Token** (`xapp-`) | Slack API → App → Basic Information → App-Level Tokens (scope: `connections:write`) |
+| **GitHub Token** | GitHub Settings > Developer settings > Personal access tokens (`repo` scope) |
+| **Slack Bot Token** (`xoxb-`) | Slack API > Create App > OAuth & Permissions > Install to Workspace |
+| **Slack App Token** (`xapp-`) | Slack API > App > Basic Information > App-Level Tokens (`connections:write`) |
 | **Moonshot API Key** | [platform.moonshot.cn](https://platform.moonshot.cn) |
 
-Required Slack App permissions and features:
-- **Socket Mode** — no public URL needed
-- **Event Subscriptions** — `app_mention`, `message.channels`
-- **Slash Commands** — `/diffusion-standup`
-- **Bot Scopes** — `chat:write`, `commands`, `reactions:write`, `channels:history`
+Required Slack App permissions:
+- **Socket Mode** enabled
+- **Event Subscriptions**: `app_mention`, `message.channels`
+- **Slash Commands**: `/diffusion-standup`
+- **Bot Scopes**: `chat:write`, `commands`, `reactions:write`, `channels:history`
+- **Interactivity**: enabled (for confirmation buttons)
 
 ## Quick Start
 
-### 1. Configure Environment Variables
+### 1. Configure
 
 ```bash
 cp .env.example .env
-# Edit .env and fill in your real tokens and channel IDs
+# Edit .env with your real tokens and channel IDs
 ```
 
-Required fields:
-
-```
-GITHUB_TOKEN=ghp_your_token
-SLACK_BOT_TOKEN=xoxb-your_token
-SLACK_APP_TOKEN=xapp-your_token
-SLACK_PR_CHANNEL=C0123456789       # Channel ID for PR notifications
-SLACK_CI_CHANNEL=C0123456789       # Channel ID for CI notifications
-MOONSHOT_API_KEY=sk-your_key       # Moonshot / Kimi API key
-```
-
-### 2. Run (pick one)
+### 2. Run
 
 ```bash
-# Option A: Docker Compose (recommended for production)
+# Docker Compose (recommended)
 docker compose up -d
 
-# Option B: Docker build directly
-docker build -t sgldhelper .
-docker run --env-file .env -v sgldhelper-data:/app/data sgldhelper
-
-# Option C: Local development
+# Or local development
 pip install -e ".[dev]"
 python -m sgldhelper
 ```
 
-On startup you should see:
+## Pollers
+
+Six pollers run automatically on startup:
+
+| Poller | Default Interval | What it does |
+|--------|-----------------|--------------|
+| PR | 60s | Detects diffusion PR lifecycle events, posts to `SLACK_PR_CHANNEL` |
+| CI | 300s | Checks CI status for tracked PRs, auto-retries failures, posts to `SLACK_CI_CHANNEL` |
+| Tracked PR Summary | 12h | AI-generated status updates for each user's tracked PRs |
+| Diffusion Summary | 2h | Periodic summary of diffusion PR activity |
+| Health Check | 2h | Batch report: merge-ready / needs-review / CI-stalled |
+| Auto Merge | event-driven | Countdown timer on CI-passed + approved tracked PRs |
+
+## AI Chat
+
+The bot responds to all messages in monitored channels and to @mentions in any channel. It uses Kimi K2.5 with function calling:
 
 ```
-starting repo=sgl-project/sglang
-slack.connected
-ai.enabled model=kimi-k2.5 base_url=https://api.moonshot.ai/v1
+这个PR是干嘛的？                    → (uses thread context from PR notification)
+CI怎么样了 #19876？                  → get_ci_status
+帮我重跑一下CI                       → trigger_ci (asks confirmation)
+跑一下健康检查                        → run_health_check
+哪些PR可以merge了？                  → get_merge_ready_prs
+merge吧                             → merge_pr (asks confirmation)
 ```
 
-## Core Features
+**16 tools**: `get_open_prs`, `get_pr_details`, `get_pr_reviews`, `search_prs`, `search_github_prs`, `get_recent_activity`, `get_my_preferences`, `update_tracked_prs`, `save_user_note`, `review_pr_code`, `get_ci_status`, `trigger_ci`, `cancel_auto_merge`, `merge_pr`, `get_merge_ready_prs`, `run_health_check`
 
-Two pollers run automatically on startup:
+Destructive tools (`trigger_ci`, `cancel_auto_merge`, `merge_pr`) require user confirmation before execution.
 
-| Poller | Interval | What it does |
-|--------|----------|--------------|
-| PR Poller | 60s | Detects diffusion PR open/update/merge/close events, pushes to `SLACK_PR_CHANNEL` |
-| CI Poller | 120s | Analyzes CI results, classifies failures, pushes to `SLACK_CI_CHANNEL`, auto-reruns flaky/infra failures |
+## CI Features
 
-### Natural Language Chat (@mention)
+### Auto Retry
+- Failed CI jobs are automatically retried up to **3 times** (normal) or **10 times** (high-priority PRs with `high-priority` label)
+- Handles `failure`, `cancelled`, and `timed_out` conclusions
 
-Mention the bot in any channel:
+### High-Priority PR Support
+PRs with the `high-priority` label get:
+- Extended retry limit (10 instead of 3)
+- GitHub @mention notification when Nvidia CI passes + PR is approved
 
-```
-@SGLDHelper What's wrong with CI on PR 1234?
-@SGLDHelper Which PRs are currently open?
-@SGLDHelper Rerun CI for PR 5678      # asks for confirmation first
-```
-
-The bot uses function calling to query internal tools for real data, then replies in natural language. Multi-turn conversations are supported within the same thread.
-
-### Passive Message Classification
-
-Messages in the 2 monitored channels are automatically classified:
-
-```
-"ControlNet PR is done, already merged"       → detected as progress_update → confirmation button
-"I'm blocked on SDXL, getting GPU OOM"        → detected as blocker → confirmation button
-```
-
-Users click **Confirm** to record the update, or **Dismiss** to ignore (avoids false positives).
-
-### Stall Alerts
-
-Runs automatically every 12 hours:
-
-- Open PRs without review approval for 2+ days → `:eyes: Review Needed`
-
-Thresholds are configurable via `REVIEW_NUDGE_DAYS`.
-
-### Standup Summary
-
-```
-/diffusion-standup
-```
-
-Collects the last 24 hours of PR and CI activity plus confirmed blockers, then generates a summary using K2.5.
+### Auto Merge
+When a tracked PR has CI passed + approved:
+1. Bot announces countdown in Slack
+2. After delay (default 5 min), squash merges
+3. Cancellable via keywords in Slack ("取消merge", "cancel merge", etc.)
 
 ## Configuration Reference
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `AI_RATE_LIMIT_RPM` | 10 | Global AI API rate limit (requests/min) |
-| `AI_USER_COOLDOWN_MAX` | 5 | Max @mentions per user within 60s |
-| `REVIEW_NUDGE_DAYS` | 2 | Days before a PR review nudge is sent |
-| `STALL_CHECK_INTERVAL` | 43200 | Stall check interval in seconds (default 12h) |
-| `KIMI_MODEL` | kimi-k2.5 | Moonshot model name (can be swapped) |
-| `MAX_AUTO_RERUNS` | 2 | Max auto-rerun attempts per CI run |
+All settings via environment variables (or `.env` file):
 
-## Development & Testing
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GITHUB_TOKEN` | — | GitHub PAT with `repo` scope |
+| `SLACK_BOT_TOKEN` | — | Slack bot token (`xoxb-`) |
+| `SLACK_APP_TOKEN` | — | Slack app token for Socket Mode (`xapp-`) |
+| `SLACK_PR_CHANNEL` | — | Channel ID for PR notifications |
+| `SLACK_CI_CHANNEL` | — | Channel ID for CI notifications |
+| `MOONSHOT_API_KEY` | — | Moonshot / Kimi API key |
+| `PR_POLL_INTERVAL` | 60 | PR polling interval (seconds) |
+| `CI_POLL_INTERVAL` | 300 | CI polling interval (seconds) |
+| `CI_MAX_RETRIES` | 3 | Max CI retry attempts per job |
+| `CI_HIGH_PRIORITY_MAX_RETRIES` | 10 | Max retries for high-priority PRs |
+| `CI_HIGH_PRIORITY_LABEL` | high-priority | Label name for high-priority PRs |
+| `CI_HIGH_PRIORITY_PING_USER` | mickqian | GitHub user to ping when HP nvidia CI passes |
+| `CI_NVIDIA_WORKFLOW_ID` | 115218617 | GitHub Actions workflow ID for Nvidia CI |
+| `CI_AMD_WORKFLOW_ID` | 119055250 | GitHub Actions workflow ID for AMD CI |
+| `AUTO_MERGE_ENABLED` | true | Enable auto-merge for tracked PRs |
+| `AUTO_MERGE_DELAY_SECONDS` | 300 | Countdown before auto-merge |
+| `TRACKED_PR_SUMMARY_INTERVAL` | 43200 | Tracked PR summary interval (seconds) |
+| `DIFFUSION_SUMMARY_INTERVAL` | 7200 | Diffusion summary interval (seconds) |
+| `PR_HEALTH_CHECK_INTERVAL` | 7200 | Health check interval (seconds) |
+| `AI_RATE_LIMIT_RPM` | 10 | Global AI API rate limit (requests/min) |
+| `AI_USER_COOLDOWN_MAX` | 5 | Max messages per user within cooldown window |
+| `AI_USER_COOLDOWN_SECONDS` | 60 | User cooldown window (seconds) |
+| `KIMI_MODEL` | kimi-k2.5 | Moonshot model name |
+| `COLD_START_MAX_PRS` | 500 | Max PRs to fetch on first run |
+| `LOG_LEVEL` | INFO | Logging level |
+
+## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/ -v
-pytest tests/test_ai_tools.py # Run AI tool tests only
+pytest tests/ -v          # Run all 127 tests
+pytest tests/test_ci_monitor.py -v  # Run specific test file
 ```
 
-All AI tests mock the OpenAI client — no real API key is needed to run them.
+All tests mock external APIs — no real tokens needed.
 
 ## Project Structure
 
 ```
 src/sgldhelper/
-├── __main__.py              # Entry point: starts all pollers + Slack
-├── config.py                # pydantic-settings env var configuration
-├── ai/                      # AI conversational layer
-│   ├── client.py            #   Kimi K2.5 OpenAI-compatible client
-│   ├── tools.py             #   11 function calling tool definitions
-│   ├── conversation.py      #   Per-thread conversation + tool loop
-│   ├── classifier.py        #   Instant-mode message classification
-│   ├── stall_detector.py    #   Review nudge detection (pure logic, no LLM)
-│   └── summaries.py         #   Standup summary generation
+├── __main__.py              # Entry point: pollers + Slack + wiring
+├── config.py                # pydantic-settings configuration
+├── ai/
+│   ├── client.py            # Kimi K2.5 OpenAI-compatible client
+│   ├── tools.py             # 16 function-calling tools
+│   ├── conversation.py      # Per-thread conversation + tool loop
+│   ├── classifier.py        # Message classification (progress/blocker)
+│   └── summaries.py         # Standup + diffusion summary generation
+├── ci/
+│   ├── monitor.py           # CI status checking, retry logic, HP support
+│   ├── auto_merge.py        # Countdown + squash merge
+│   ├── health_check.py      # Periodic batch health report
+│   └── tracked_pr_summary.py # Per-user tracked PR summaries
 ├── db/
-│   ├── engine.py            #   aiosqlite connection management
-│   ├── models.py            #   8-table DDL schema
-│   └── queries.py           #   All DB query functions
+│   ├── engine.py            # aiosqlite connection management
+│   ├── models.py            # 10-table DDL schema
+│   └── queries.py           # All DB query functions
 ├── github/
-│   ├── client.py            #   GitHub REST API (ETag caching + rate limiting)
-│   ├── pr_tracker.py        #   PR polling + diffusion file detection
-│   ├── ci_analyzer.py       #   CI failure classification
-│   ├── ci_rerunner.py       #   Auto/manual CI rerun
-│   └── poller.py            #   Generic async polling scheduler
+│   ├── client.py            # GitHub REST API (ETag caching + rate limiting)
+│   ├── pr_tracker.py        # PR polling + diffusion file detection
+│   └── poller.py            # Generic async polling scheduler
 ├── slack/
-│   ├── app.py               #   Slack Bolt + Socket Mode wrapper
-│   ├── channels.py          #   Channel routing
-│   ├── handlers.py          #   AI handlers (mentions, classification, standup)
-│   └── messages.py          #   Block Kit message templates
+│   ├── app.py               # Slack Bolt + Socket Mode wrapper
+│   ├── channels.py          # Channel routing
+│   ├── handlers.py          # Message + mention + action handlers
+│   └── messages.py          # Block Kit message templates
 ├── notifications/
-│   ├── dispatcher.py        #   Event routing
-│   ├── pr_events.py         #   PR lifecycle notifications
-│   └── ci_events.py         #   CI notifications
+│   ├── dispatcher.py        # Event routing facade
+│   ├── pr_events.py         # PR lifecycle notifications
+│   └── ci_events.py         # CI status notifications
 └── utils/
-    ├── logging_setup.py     #   structlog configuration
-    └── rate_limiter.py      #   Token-bucket rate limiter
+    ├── logging_setup.py     # structlog JSON configuration
+    └── rate_limiter.py      # Token-bucket rate limiter
 ```

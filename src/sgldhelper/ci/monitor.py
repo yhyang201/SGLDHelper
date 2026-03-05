@@ -208,23 +208,66 @@ class CIMonitor:
         )
         return count < max_retries
 
-    async def trigger_ci(self, pr_number: int, has_label: bool) -> None:
-        """Trigger CI by adding run-ci label comment. Uses lock to prevent concurrent triggers."""
+    async def trigger_ci(self, pr_number: int, has_label: bool) -> dict[str, Any]:
+        """Trigger CI by adding run-ci label comment. Uses lock to prevent concurrent triggers.
+
+        Returns a dict describing what actually happened:
+        - method: "comment" | "rerun"
+        - rerun_ids: list of run IDs that were rerun (only for method="rerun")
+        - skipped_runs: list of {run_id, status, conclusion} for runs that were
+          skipped (matched workflow but didn't meet rerun criteria)
+        """
         async with self._trigger_lock:
             if not has_label:
                 await self._gh.create_issue_comment(pr_number, "/tag-and-rerun-ci")
                 log.info("ci.triggered_via_comment", pr=pr_number)
-            else:
-                # If label exists, find runs and rerun failed
-                pr_data = await self._gh.get_pull(pr_number)
-                sha = pr_data["head"]["sha"]
-                runs = await self._gh.get_workflow_runs_for_ref(sha)
-                for run in runs:
-                    wf_id = run.get("workflow_id")
-                    if wf_id in (self._settings.ci_nvidia_workflow_id, self._settings.ci_amd_workflow_id):
-                        if run["status"] == "completed" and run["conclusion"] == "failure":
-                            await self._gh.rerun_failed_jobs(run["id"])
-                            log.info("ci.rerun_triggered", pr=pr_number, run_id=run["id"])
+                return {"method": "comment", "rerun_ids": [], "skipped_runs": []}
+
+            # If label exists, find runs and rerun failed
+            pr_data = await self._gh.get_pull(pr_number)
+            sha = pr_data["head"]["sha"]
+            runs = await self._gh.get_workflow_runs_for_ref(sha)
+
+            rerun_ids: list[int] = []
+            skipped_runs: list[dict[str, Any]] = []
+
+            for run in runs:
+                wf_id = run.get("workflow_id")
+                if wf_id not in (self._settings.ci_nvidia_workflow_id, self._settings.ci_amd_workflow_id):
+                    continue
+
+                run_id = run["id"]
+                status = run["status"]
+                conclusion = run.get("conclusion")
+
+                if status == "completed" and conclusion in ("failure", "cancelled", "timed_out"):
+                    await self._gh.rerun_failed_jobs(run_id)
+                    rerun_ids.append(run_id)
+                    log.info("ci.rerun_triggered", pr=pr_number, run_id=run_id, conclusion=conclusion)
+                else:
+                    skipped_runs.append({
+                        "run_id": run_id,
+                        "status": status,
+                        "conclusion": conclusion,
+                        "workflow_id": wf_id,
+                    })
+                    log.info(
+                        "ci.rerun_skipped",
+                        pr=pr_number,
+                        run_id=run_id,
+                        status=status,
+                        conclusion=conclusion,
+                    )
+
+            if not rerun_ids and not skipped_runs:
+                log.warning(
+                    "ci.no_matching_runs",
+                    pr=pr_number,
+                    sha=sha,
+                    total_runs=len(runs),
+                )
+
+            return {"method": "rerun", "rerun_ids": rerun_ids, "skipped_runs": skipped_runs}
 
     async def poll_all_tracked_prs(self) -> None:
         """Poll CI for all tracked PRs. Called by the CI poller."""

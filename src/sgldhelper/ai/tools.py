@@ -40,10 +40,11 @@ class ToolRegistry:
         self._tools: dict[str, _ToolDef] = {}
         self._register_all()
 
-    def set_ci_components(self, ci_monitor: Any, auto_merge: Any) -> None:
-        """Inject CI monitor and auto-merge manager after construction."""
+    def set_ci_components(self, ci_monitor: Any, auto_merge: Any, health_checker: Any = None) -> None:
+        """Inject CI monitor, auto-merge manager, and health checker after construction."""
         self._ci_monitor = ci_monitor
         self._auto_merge = auto_merge
+        self._health_checker = health_checker
 
     def _register_all(self) -> None:
         """Register all available tools."""
@@ -277,6 +278,17 @@ class ToolRegistry:
             handler=self._get_merge_ready_prs,
         )
 
+        self._register(
+            name="run_health_check",
+            description=(
+                "Manually trigger the Diffusion PR health check report. "
+                "Posts the same report as the periodic 2-hour check to the CI channel. "
+                "Use when the user asks to run/trigger a health check or 跑健康检查."
+            ),
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=self._run_health_check,
+        )
+
     def _register(
         self,
         name: str,
@@ -495,8 +507,15 @@ class ToolRegistry:
             pr_data = await self._gh.get_pull(pr_number)
             labels = [l["name"].lower() for l in pr_data.get("labels", [])]
             has_label = "run-ci" in labels
-            await self._ci_monitor.trigger_ci(pr_number, has_label)
-            return {"pr_number": pr_number, "triggered": True, "method": "rerun" if has_label else "comment"}
+            result = await self._ci_monitor.trigger_ci(pr_number, has_label)
+            triggered = bool(result["rerun_ids"]) if result["method"] == "rerun" else True
+            return {
+                "pr_number": pr_number,
+                "triggered": triggered,
+                "method": result["method"],
+                "rerun_ids": result["rerun_ids"],
+                "skipped_runs": result["skipped_runs"],
+            }
         except Exception as e:
             return {"error": f"Failed to trigger CI: {e}"}
 
@@ -589,6 +608,15 @@ class ToolRegistry:
             if "404" in error_msg:
                 return {"error": f"PR #{pr_number} not found"}
             return {"error": f"Merge failed: {error_msg}"}
+
+    async def _run_health_check(self) -> dict[str, Any]:
+        if not self._health_checker:
+            return {"error": "Health checker not initialized"}
+        try:
+            await self._health_checker.poll()
+            return {"status": "ok", "message": "Health check report posted to CI channel"}
+        except Exception as e:
+            return {"error": f"Health check failed: {e}"}
 
 
 class _ToolDef:

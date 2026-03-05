@@ -76,10 +76,13 @@ async def _run() -> None:
         on_cancelled=dispatcher.ci.notify_merge_cancelled,
     )
 
+    # --- PR health checker ---
+    health_checker = PRHealthChecker(gh, db, ci_monitor, slack_app, channels, settings)
+
     # --- Initialise AI components ---
     kimi = KimiClient(settings)
     tool_registry = ToolRegistry(db, gh, settings)
-    tool_registry.set_ci_components(ci_monitor, auto_merge)
+    tool_registry.set_ci_components(ci_monitor, auto_merge, health_checker)
     conversation_manager = ConversationManager(kimi, tool_registry, db, settings)
     classifier = MessageClassifier(kimi, db, settings)
     summary_generator = SummaryGenerator(kimi, db, settings)
@@ -88,9 +91,6 @@ async def _run() -> None:
     # --- Tracked PR summary generator ---
     tracked_pr_summary = TrackedPRSummaryGenerator(kimi, gh, db, settings)
     tracked_pr_summary.set_callback(dispatcher.ci.notify_tracked_pr_summary)
-
-    # --- PR health checker ---
-    health_checker = PRHealthChecker(gh, db, ci_monitor, slack_app, channels, settings)
 
     register_handlers(
         slack_app, db, channels, settings,

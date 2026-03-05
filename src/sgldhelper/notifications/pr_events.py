@@ -40,10 +40,11 @@ class PREventHandler:
 
         if change.event == PREvent.OPENED:
             # Create a new top-level message
-            result = await self._slack.post_message(
+            result = await self._slack.post_message_with_context(
                 self._channels.pr_channel,
                 text=msg["text"],
                 blocks=msg.get("blocks"),
+                db_conn=db.conn,
             )
             thread_ts = result.get("ts")
             if thread_ts:
@@ -52,11 +53,12 @@ class PREventHandler:
         else:
             # Reply in thread if we have one
             thread_ts = stored.get("slack_thread_ts") if stored else None
-            await self._slack.post_message(
+            await self._slack.post_message_with_context(
                 self._channels.pr_channel,
                 text=msg["text"],
                 blocks=msg.get("blocks"),
                 thread_ts=thread_ts,
+                db_conn=db.conn,
             )
             log.info("notification.pr_event", pr=pr_number, event=change.event.value)
 

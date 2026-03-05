@@ -40,7 +40,7 @@ async def registry(db, mock_gh, settings):
 class TestToolSchemas:
     def test_schemas_are_valid(self, registry):
         schemas = registry.get_schemas()
-        assert len(schemas) == 15
+        assert len(schemas) == 16
 
         for schema in schemas:
             assert schema["type"] == "function"
@@ -59,7 +59,7 @@ class TestToolSchemas:
             "get_my_preferences", "update_tracked_prs",
             "save_user_note", "review_pr_code",
             "get_ci_status", "trigger_ci", "cancel_auto_merge",
-            "merge_pr", "get_merge_ready_prs",
+            "merge_pr", "get_merge_ready_prs", "run_health_check",
         }
         assert names == expected
 
