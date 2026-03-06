@@ -212,11 +212,11 @@ class CIMonitor:
         return count < max_retries
 
     async def trigger_ci(self, pr_number: int, has_label: bool) -> dict[str, Any]:
-        """Trigger CI by adding run-ci label comment. Uses lock to prevent concurrent triggers.
+        """Trigger CI via PR comment. Uses lock to prevent concurrent triggers.
 
         Returns a dict describing what actually happened:
-        - method: "comment" | "rerun"
-        - rerun_ids: list of run IDs that were rerun (only for method="rerun")
+        - method: "comment" (always comments now)
+        - rerun_ids: list of run IDs that had failures (for which /rerun-failed-ci was posted)
         - skipped_runs: list of {run_id, status, conclusion} for runs that were
           skipped (matched workflow but didn't meet rerun criteria)
         """
@@ -234,6 +234,7 @@ class CIMonitor:
             rerun_ids: list[int] = []
             skipped_runs: list[dict[str, Any]] = []
 
+            has_failed = False
             for run in runs:
                 wf_id = run.get("workflow_id")
                 if wf_id not in (self._settings.ci_nvidia_workflow_id, self._settings.ci_amd_workflow_id):
@@ -244,9 +245,8 @@ class CIMonitor:
                 conclusion = run.get("conclusion")
 
                 if status == "completed" and conclusion in ("failure", "cancelled", "timed_out"):
-                    await self._gh.rerun_failed_jobs(run_id)
+                    has_failed = True
                     rerun_ids.append(run_id)
-                    log.info("ci.rerun_triggered", pr=pr_number, run_id=run_id, conclusion=conclusion)
                 else:
                     skipped_runs.append({
                         "run_id": run_id,
@@ -262,7 +262,10 @@ class CIMonitor:
                         conclusion=conclusion,
                     )
 
-            if not rerun_ids and not skipped_runs:
+            if has_failed:
+                await self._gh.create_issue_comment(pr_number, "/rerun-failed-ci")
+                log.info("ci.rerun_via_comment", pr=pr_number, run_ids=rerun_ids)
+            elif not skipped_runs:
                 log.warning(
                     "ci.no_matching_runs",
                     pr=pr_number,
@@ -270,7 +273,7 @@ class CIMonitor:
                     total_runs=len(runs),
                 )
 
-            return {"method": "rerun", "rerun_ids": rerun_ids, "skipped_runs": skipped_runs}
+            return {"method": "comment", "rerun_ids": rerun_ids, "skipped_runs": skipped_runs}
 
     async def poll_all_tracked_prs(self) -> None:
         """Poll CI for all tracked PRs. Called by the CI poller."""
@@ -321,6 +324,9 @@ class CIMonitor:
         # --- Nvidia ping ---
         if self._on_high_priority_nvidia_passed:
             await self._maybe_nvidia_ping(pr_number, head_sha, ci_status)
+
+        # --- Approve auto-CI: start or retry CI when approved by configured users ---
+        await self._maybe_approve_auto_ci(pr_number, head_sha, ci_status)
 
         # --- Owner rerun: auto-retry on failure ---
         if (
@@ -405,26 +411,83 @@ class CIMonitor:
 
         # Retry failed jobs up to ci_owner_rerun_max_retries
         max_retries = self._settings.ci_owner_rerun_max_retries
-        rerun_ids: set[int] = set()
+        should_rerun = False
         for job in ci_status.failed_jobs:
             count = await queries.get_ci_retry_count(
                 self._db.conn, pr_number, head_sha, job.job_name
             )
             if count < max_retries:
-                if job.run_id not in rerun_ids:
-                    try:
-                        await self._gh.rerun_failed_jobs(job.run_id)
-                        rerun_ids.add(job.run_id)
-                    except Exception:
-                        log.exception("ci_monitor.owner_rerun_failed",
-                                      pr=pr_number, run_id=job.run_id)
+                should_rerun = True
                 await queries.increment_ci_retry(
                     self._db.conn, pr_number, head_sha, job.job_name
                 )
 
-        if rerun_ids:
+        if should_rerun:
+            try:
+                await self._gh.create_issue_comment(pr_number, "/rerun-failed-ci")
+            except Exception:
+                log.exception("ci_monitor.owner_rerun_comment_failed", pr=pr_number)
             log.info("ci_monitor.owner_rerun_triggered",
-                     pr=pr_number, run_ids=list(rerun_ids), owner=owner)
+                     pr=pr_number, owner=owner)
+
+    async def _maybe_approve_auto_ci(
+        self, pr_number: int, head_sha: str, ci_status: CIStatus,
+    ) -> None:
+        """If an approved-by user (mickqian/bbuf) approved this PR:
+        - No run-ci label → comment /tag-and-rerun-ci to start CI
+        - CI failed → comment /rerun-failed-ci (up to ci_approve_auto_ci_max_retries)
+        """
+        # Check if any configured user approved
+        reviews = await self._gh.get_pull_reviews(pr_number)
+        approved_users = {r["user"]["login"] for r in reviews if r.get("state") == "APPROVED"}
+        auto_ci_users = set(self._settings.ci_approve_auto_ci_users)
+        if not approved_users & auto_ci_users:
+            return
+
+        # Case 1: No run-ci label → start CI
+        if not ci_status.has_run_ci_label:
+            snapshot = await queries.get_ci_snapshot(self._db.conn, pr_number, head_sha)
+            snapshot_data = self._load_snapshot_data(snapshot)
+            if snapshot_data.get("approve_auto_ci_started"):
+                return  # Already commented once for this SHA
+            try:
+                await self._gh.create_issue_comment(pr_number, "/tag-and-rerun-ci")
+                log.info("ci_monitor.approve_auto_ci_started", pr=pr_number)
+            except Exception:
+                log.exception("ci_monitor.approve_auto_ci_comment_failed", pr=pr_number)
+                return
+            snapshot_data["approve_auto_ci_started"] = True
+            await queries.upsert_ci_snapshot(
+                self._db.conn, pr_number, head_sha,
+                overall_status=ci_status.overall.value,
+                has_run_ci_label=ci_status.has_run_ci_label,
+                failed_jobs=json.dumps([j.job_name for j in ci_status.failed_jobs]),
+                snapshot_data=json.dumps(snapshot_data),
+            )
+            return
+
+        # Case 2: CI failed → retry
+        if (
+            ci_status.overall == CIOverallStatus.FAILED
+            and ci_status.all_runs_completed
+        ):
+            max_retries = self._settings.ci_approve_auto_ci_max_retries
+            should_rerun = False
+            for job in ci_status.failed_jobs:
+                count = await queries.get_ci_retry_count(
+                    self._db.conn, pr_number, head_sha, job.job_name
+                )
+                if count < max_retries:
+                    should_rerun = True
+                    await queries.increment_ci_retry(
+                        self._db.conn, pr_number, head_sha, job.job_name
+                    )
+            if should_rerun:
+                try:
+                    await self._gh.create_issue_comment(pr_number, "/rerun-failed-ci")
+                    log.info("ci_monitor.approve_auto_ci_retried", pr=pr_number)
+                except Exception:
+                    log.exception("ci_monitor.approve_auto_ci_retry_failed", pr=pr_number)
 
     @staticmethod
     def _load_snapshot_data(snapshot: dict[str, Any] | None) -> dict[str, Any]:
@@ -486,6 +549,9 @@ class CIMonitor:
             commit_count=commit_count,
         )
 
+        # --- Approve auto-CI: start or retry CI when approved by configured users ---
+        await self._maybe_approve_auto_ci(pr_number, head_sha, ci_status)
+
         # --- Nvidia passed + approved → ping (once) ---
         # Skip if auto-merge is already pending for this PR
         merge_pending = self._is_merge_pending and self._is_merge_pending(pr_number)
@@ -544,18 +610,16 @@ class CIMonitor:
                     permanent.append(job)
 
             if retryable:
-                # Rerun the failed runs
-                rerun_ids: set[int] = set()
+                # Comment to trigger rerun
                 for job in retryable:
-                    if job.run_id not in rerun_ids:
-                        try:
-                            await self._gh.rerun_failed_jobs(job.run_id)
-                            rerun_ids.add(job.run_id)
-                        except Exception:
-                            log.exception("ci_monitor.rerun_failed", pr=pr_number, run_id=job.run_id)
                     await queries.increment_ci_retry(
                         self._db.conn, pr_number, head_sha, job.job_name
                     )
+                try:
+                    await self._gh.create_issue_comment(pr_number, "/rerun-failed-ci")
+                    log.info("ci_monitor.rerun_via_comment", pr=pr_number)
+                except Exception:
+                    log.exception("ci_monitor.rerun_comment_failed", pr=pr_number)
 
                 if self._on_ci_failed_retrying:
                     await self._on_ci_failed_retrying(pr_number, user_ids, retryable)

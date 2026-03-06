@@ -30,6 +30,27 @@ def _pr_url(repo: str, pr_number: int) -> str:
     return f"https://github.com/{repo}/pull/{pr_number}"
 
 
+_WF_STATUS_LABELS = {
+    "passed": "✅",
+    "failed": "❌",
+    "no_run": "⚪ 未运行",
+}
+
+
+def _ci_detail_label(pr_info: dict[str, Any]) -> str:
+    """Build a human-readable CI detail string showing per-workflow status."""
+    nvidia = pr_info.get("nvidia")
+    amd = pr_info.get("amd")
+    if not nvidia and not amd:
+        return "失败未重跑"
+    parts: list[str] = []
+    if nvidia:
+        parts.append(f"Nvidia {_WF_STATUS_LABELS.get(nvidia, nvidia)}")
+    if amd:
+        parts.append(f"AMD {_WF_STATUS_LABELS.get(amd, amd)}")
+    return " | ".join(parts)
+
+
 class PRHealthChecker:
     """Batch-check all open diffusion PRs and post a health report."""
 
@@ -83,12 +104,32 @@ class PRHealthChecker:
             reviews = await self._gh.get_pull_reviews(pr_num)
             has_approval = any(r.get("state") == "APPROVED" for r in reviews)
 
-            ci_passed = ci_status.overall == CIOverallStatus.PASSED
+            # Both Nvidia AND AMD must have jobs and all pass
+            ci_passed = (
+                ci_status.overall == CIOverallStatus.PASSED
+                and bool(ci_status.nvidia_jobs)
+                and bool(ci_status.amd_jobs)
+            )
             ci_failed = ci_status.overall == CIOverallStatus.FAILED
             ci_none = ci_status.overall == CIOverallStatus.NO_CI
+            # Partial CI: overall says passed but one workflow never ran
+            ci_partial = (
+                ci_status.overall == CIOverallStatus.PASSED
+                and not ci_passed
+            )
             mergeable = bool(pr_data.get("mergeable"))
 
-            pr_info = {
+            # Per-workflow pass/fail breakdown
+            nvidia_passed = (
+                bool(ci_status.nvidia_jobs)
+                and all(j.conclusion == "success" for j in ci_status.nvidia_jobs)
+            )
+            amd_passed = (
+                bool(ci_status.amd_jobs)
+                and all(j.conclusion == "success" for j in ci_status.amd_jobs)
+            )
+
+            pr_info: dict[str, Any] = {
                 "pr_number": pr_num,
                 "title": title,
                 "author": author,
@@ -98,12 +139,18 @@ class PRHealthChecker:
                 merge_ready.append(pr_info)
             elif ci_passed and not has_approval:
                 needs_review.append(pr_info)
-            elif has_approval and (ci_none or (ci_failed and ci_status.all_runs_completed)):
-                # Distinguish "CI not started" (no run-ci label) from "CI failed"
+            elif has_approval and (ci_none or ci_partial or (ci_failed and ci_status.all_runs_completed)):
+                # Distinguish "CI not started" / "partial" / "failed"
                 if not ci_status.has_run_ci_label:
                     pr_info["ci_status"] = "not_started"
+                elif ci_partial:
+                    pr_info["ci_status"] = "partial"
+                    pr_info["nvidia"] = "passed" if nvidia_passed else ("no_run" if not ci_status.nvidia_jobs else "failed")
+                    pr_info["amd"] = "passed" if amd_passed else ("no_run" if not ci_status.amd_jobs else "failed")
                 else:
                     pr_info["ci_status"] = ci_status.overall.value
+                    pr_info["nvidia"] = "passed" if nvidia_passed else ("no_run" if not ci_status.nvidia_jobs else "failed")
+                    pr_info["amd"] = "passed" if amd_passed else ("no_run" if not ci_status.amd_jobs else "failed")
                 ci_stalled.append(pr_info)
 
         await self._post_report(merge_ready, needs_review, ci_stalled)
@@ -147,7 +194,8 @@ class PRHealthChecker:
                 elif status == "no_ci":
                     label = "未运行"
                 else:
-                    label = "失败未重跑"
+                    # Build per-workflow detail
+                    label = _ci_detail_label(p)
                 lines.append(
                     f"• <{_pr_url(repo, p['pr_number'])}|#{p['pr_number']}> {p['title']} "
                     f"(`{p['author']}`) — CI {label}"

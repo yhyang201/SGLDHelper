@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     ci_high_priority_label: str = "high-priority"
     ci_high_priority_ping_user: str = "mickqian"
     ci_owner_rerun_max_retries: int = 5
+    ci_approve_auto_ci_users: list[str] = Field(
+        default=["mickqian", "bbuf"],
+    )
+    ci_approve_auto_ci_max_retries: int = 3
     ci_nvidia_workflow_id: int = 115218617
     ci_amd_workflow_id: int = 119055250
 

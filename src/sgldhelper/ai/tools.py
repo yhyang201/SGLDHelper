@@ -508,7 +508,7 @@ class ToolRegistry:
             labels = [l["name"].lower() for l in pr_data.get("labels", [])]
             has_label = "run-ci" in labels
             result = await self._ci_monitor.trigger_ci(pr_number, has_label)
-            triggered = bool(result["rerun_ids"]) if result["method"] == "rerun" else True
+            triggered = bool(result["rerun_ids"]) or not result["skipped_runs"]
             return {
                 "pr_number": pr_number,
                 "triggered": triggered,

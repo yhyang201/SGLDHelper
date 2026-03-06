@@ -180,7 +180,7 @@ class TestTriggerCI:
 
     @pytest.mark.asyncio
     async def test_trigger_with_label(self, ci_monitor, mock_gh, settings):
-        """Should rerun failed jobs when run-ci label exists."""
+        """Should comment /rerun-failed-ci when run-ci label exists and CI failed."""
         mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
             {
                 "id": 100,
@@ -190,7 +190,7 @@ class TestTriggerCI:
             },
         ])
         await ci_monitor.trigger_ci(19876, has_label=True)
-        mock_gh.rerun_failed_jobs.assert_called_once_with(100)
+        mock_gh.create_issue_comment.assert_called_once_with(19876, "/rerun-failed-ci")
 
 
 class TestHighPriority:
@@ -357,17 +357,17 @@ class TestOwnerRerun:
 
     @pytest.mark.asyncio
     async def test_owner_rerun_triggers_retry(self, ci_monitor, mock_gh, db, settings):
-        """Should auto-retry when owner commented /tag-and-rerun-ci."""
+        """Should comment /rerun-failed-ci when owner commented /tag-and-rerun-ci."""
         self._setup_failed_ci(mock_gh, settings)
         await ci_monitor._check_untracked_pr(19876)
-        mock_gh.rerun_failed_jobs.assert_called_once_with(1)
+        mock_gh.create_issue_comment.assert_called_once_with(19876, "/rerun-failed-ci")
 
     @pytest.mark.asyncio
     async def test_owner_rerun_no_comment_no_retry(self, ci_monitor, mock_gh, db, settings):
-        """Should NOT retry when owner has not commented."""
+        """Should NOT comment /rerun-failed-ci when owner has not commented."""
         self._setup_failed_ci(mock_gh, settings, with_owner_comment=False)
         await ci_monitor._check_untracked_pr(19876)
-        mock_gh.rerun_failed_jobs.assert_not_called()
+        mock_gh.create_issue_comment.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_owner_rerun_respects_max_retries(self, ci_monitor, mock_gh, db, settings):
@@ -381,7 +381,7 @@ class TestOwnerRerun:
             await queries.increment_ci_retry(db.conn, 19876, "abc123def456", "test-gpu")
 
         await ci_monitor._check_untracked_pr(19876)
-        mock_gh.rerun_failed_jobs.assert_not_called()
+        mock_gh.create_issue_comment.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_owner_rerun_caches_comment_check(self, ci_monitor, mock_gh, db, settings):
@@ -393,6 +393,91 @@ class TestOwnerRerun:
         assert mock_gh.get_issue_comments.call_count == 1
 
         # Second call — uses cached value
-        mock_gh.rerun_failed_jobs.reset_mock()
+        mock_gh.create_issue_comment.reset_mock()
         await ci_monitor._check_untracked_pr(19876)
         assert mock_gh.get_issue_comments.call_count == 1  # Still 1, cached
+
+
+class TestApproveAutoCI:
+    """Tests for auto-CI on approval by configured users (mickqian/bbuf)."""
+
+    def _setup_pr(self, mock_gh, settings, *, has_label=False, ci_failed=False,
+                  approver="mickqian"):
+        labels = [{"name": "run-ci"}] if has_label else []
+        mock_gh.get_pull = AsyncMock(return_value={
+            "number": 19876, "state": "open",
+            "head": {"sha": "abc123def456"},
+            "labels": labels,
+            "user": {"login": "alice"},
+            "title": "Test PR",
+            "updated_at": "2025-03-01T00:00:00Z",
+        })
+        mock_gh.get_pull_reviews = AsyncMock(return_value=[
+            {"user": {"login": approver}, "state": "APPROVED"},
+        ])
+
+        if has_label:
+            conclusion = "failure" if ci_failed else "success"
+            status = "completed"
+            mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+                {"id": 1, "workflow_id": settings.ci_nvidia_workflow_id,
+                 "status": status, "conclusion": conclusion},
+            ])
+            mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
+                {"name": "build", "status": status, "conclusion": conclusion, "id": 10},
+            ])
+        else:
+            mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[])
+            mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[])
+
+        mock_gh.get_issue_comments = AsyncMock(return_value=[])
+        mock_gh.get_pull_commits = AsyncMock(return_value=[{"sha": "abc123"}])
+
+    @pytest.mark.asyncio
+    async def test_no_label_starts_ci(self, ci_monitor, mock_gh, db, settings):
+        """When approved by configured user and no run-ci label, comment /tag-and-rerun-ci."""
+        self._setup_pr(mock_gh, settings, has_label=False)
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.create_issue_comment.assert_called_once_with(19876, "/tag-and-rerun-ci")
+
+    @pytest.mark.asyncio
+    async def test_no_label_no_duplicate(self, ci_monitor, mock_gh, db, settings):
+        """Should only comment /tag-and-rerun-ci once per SHA."""
+        self._setup_pr(mock_gh, settings, has_label=False)
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.create_issue_comment.reset_mock()
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.create_issue_comment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ci_failed_retries(self, ci_monitor, mock_gh, db, settings):
+        """When approved and CI failed, comment /rerun-failed-ci."""
+        self._setup_pr(mock_gh, settings, has_label=True, ci_failed=True)
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.create_issue_comment.assert_called_once_with(19876, "/rerun-failed-ci")
+
+    @pytest.mark.asyncio
+    async def test_ci_failed_respects_max_retries(self, ci_monitor, mock_gh, db, settings):
+        """Should stop retrying after ci_approve_auto_ci_max_retries."""
+        from sgldhelper.db import queries
+
+        self._setup_pr(mock_gh, settings, has_label=True, ci_failed=True)
+        for _ in range(settings.ci_approve_auto_ci_max_retries):
+            await queries.increment_ci_retry(db.conn, 19876, "abc123def456", "build")
+
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.create_issue_comment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_configured_user_no_action(self, ci_monitor, mock_gh, db, settings):
+        """When approved by a user NOT in ci_approve_auto_ci_users, do nothing."""
+        self._setup_pr(mock_gh, settings, has_label=False, approver="random_user")
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.create_issue_comment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bbuf_also_triggers(self, ci_monitor, mock_gh, db, settings):
+        """bbuf approval should also trigger auto-CI."""
+        self._setup_pr(mock_gh, settings, has_label=False, approver="bbuf")
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.create_issue_comment.assert_called_once_with(19876, "/tag-and-rerun-ci")

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from sgldhelper.ci.health_check import PRHealthChecker
-from sgldhelper.ci.monitor import CIMonitor, CIOverallStatus, CIStatus
+from sgldhelper.ci.monitor import CIJobResult, CIMonitor, CIOverallStatus, CIStatus
 from sgldhelper.db import queries
 
 
@@ -24,13 +24,34 @@ def _make_pr_data(pr_number, *, mergeable=True, labels=None):
     }
 
 
-def _make_ci_status(pr_number, overall: CIOverallStatus, *, completed=True):
+def _make_job(name: str, workflow: str = "nvidia", conclusion: str = "success") -> CIJobResult:
+    return CIJobResult(
+        job_name=name, workflow_name=workflow,
+        status="completed", conclusion=conclusion, run_id=1, job_id=1,
+    )
+
+
+def _make_ci_status(
+    pr_number,
+    overall: CIOverallStatus,
+    *,
+    completed=True,
+    both_ci=False,
+    nvidia_conclusion: str = "success",
+    amd_conclusion: str = "success",
+):
+    nvidia_jobs = [_make_job("build", "nvidia", nvidia_conclusion)] if both_ci else []
+    amd_jobs = [_make_job("build", "amd", amd_conclusion)] if both_ci else []
+    failed = [j for j in nvidia_jobs + amd_jobs if j.conclusion == "failure"]
     return CIStatus(
         pr_number=pr_number,
         head_sha=f"sha{pr_number}",
         overall=overall,
         has_run_ci_label=True,
         all_runs_completed=completed,
+        nvidia_jobs=nvidia_jobs,
+        amd_jobs=amd_jobs,
+        failed_jobs=failed,
     )
 
 
@@ -87,9 +108,9 @@ class TestHealthCheck:
             {"user": {"login": "bob"}, "state": "APPROVED"},
         ])
         mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[])
-        # Override ci_monitor to return PASSED
+        # Override ci_monitor to return PASSED with both workflows
         ci_monitor.check_pr_ci = AsyncMock(
-            return_value=_make_ci_status(100, CIOverallStatus.PASSED)
+            return_value=_make_ci_status(100, CIOverallStatus.PASSED, both_ci=True)
         )
 
         await health_checker.poll()
@@ -108,7 +129,7 @@ class TestHealthCheck:
         mock_gh.get_pull = AsyncMock(return_value=_make_pr_data(200))
         mock_gh.get_pull_reviews = AsyncMock(return_value=[])
         ci_monitor.check_pr_ci = AsyncMock(
-            return_value=_make_ci_status(200, CIOverallStatus.PASSED)
+            return_value=_make_ci_status(200, CIOverallStatus.PASSED, both_ci=True)
         )
 
         await health_checker.poll()
@@ -157,3 +178,57 @@ class TestHealthCheck:
         text = health_checker._slack.post_message_with_context.call_args.kwargs["text"]
         assert "#400" in text
         assert "CI 需处理" in text
+
+    @pytest.mark.asyncio
+    async def test_ci_failed_shows_workflow_detail(self, health_checker, db, mock_gh, ci_monitor):
+        """When CI fails, report should show which workflow (Nvidia/AMD) failed."""
+        await queries.upsert_pr(db.conn, {
+            "pr_number": 500, "title": "AMD Failed", "author": "eve",
+            "state": "open", "head_sha": "sha500", "updated_at": "2025-03-01",
+            "changed_files": 1,
+        })
+        mock_gh.get_pull = AsyncMock(return_value=_make_pr_data(500))
+        mock_gh.get_pull_reviews = AsyncMock(return_value=[
+            {"user": {"login": "bob"}, "state": "APPROVED"},
+        ])
+        # Nvidia passed, AMD failed
+        ci_monitor.check_pr_ci = AsyncMock(
+            return_value=_make_ci_status(
+                500, CIOverallStatus.FAILED, completed=True,
+                both_ci=True, nvidia_conclusion="success", amd_conclusion="failure",
+            )
+        )
+
+        await health_checker.poll()
+        text = health_checker._slack.post_message_with_context.call_args.kwargs["text"]
+        assert "#500" in text
+        assert "Nvidia ✅" in text
+        assert "AMD ❌" in text
+
+    @pytest.mark.asyncio
+    async def test_ci_partial_shows_workflow_detail(self, health_checker, db, mock_gh, ci_monitor):
+        """Partial CI (one workflow missing) shows which is missing."""
+        await queries.upsert_pr(db.conn, {
+            "pr_number": 600, "title": "Only Nvidia", "author": "frank",
+            "state": "open", "head_sha": "sha600", "updated_at": "2025-03-01",
+            "changed_files": 1,
+        })
+        mock_gh.get_pull = AsyncMock(return_value=_make_pr_data(600))
+        mock_gh.get_pull_reviews = AsyncMock(return_value=[
+            {"user": {"login": "bob"}, "state": "APPROVED"},
+        ])
+        # Only nvidia passed, no AMD jobs at all
+        status = CIStatus(
+            pr_number=600, head_sha="sha600",
+            overall=CIOverallStatus.PASSED, has_run_ci_label=True,
+            all_runs_completed=True,
+            nvidia_jobs=[_make_job("build", "nvidia")],
+            amd_jobs=[],
+        )
+        ci_monitor.check_pr_ci = AsyncMock(return_value=status)
+
+        await health_checker.poll()
+        text = health_checker._slack.post_message_with_context.call_args.kwargs["text"]
+        assert "#600" in text
+        assert "Nvidia ✅" in text
+        assert "AMD ⚪ 未运行" in text
