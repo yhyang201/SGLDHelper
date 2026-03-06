@@ -107,23 +107,6 @@ async def _run() -> None:
 
         changes = await pr_tracker.poll()
         for change in changes:
-            if change.event == PREvent.OPENED:
-                try:
-                    await gh.create_issue_comment(
-                        change.pr["pr_number"], "/tag-and-rerun-ci"
-                    )
-                    log.info(
-                        "ci.initial_trigger",
-                        pr=change.pr["pr_number"],
-                        comment="/tag-and-rerun-ci",
-                    )
-                except Exception as exc:
-                    log.error(
-                        "ci.initial_trigger_failed",
-                        pr=change.pr["pr_number"],
-                        error=str(exc),
-                    )
-
             # Phase 7: PR lifecycle — untrack merged/closed PRs
             if change.event in (PREvent.MERGED, PREvent.CLOSED):
                 pr_num = change.pr["pr_number"]
