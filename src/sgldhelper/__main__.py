@@ -69,6 +69,7 @@ async def _run() -> None:
         on_ci_failed_permanent=dispatcher.ci.notify_ci_failed_permanent,
         on_merge_ready_check=_make_merge_ready_handler(auto_merge),
         on_high_priority_nvidia_passed=_make_hp_nvidia_handler(gh, settings),
+        is_merge_pending=auto_merge.is_pending,
     )
     auto_merge.set_callbacks(
         on_countdown=dispatcher.ci.notify_merge_countdown,
@@ -140,8 +141,9 @@ async def _run() -> None:
             await dispatcher.pr.handle(change, db)
 
     async def poll_ci() -> None:
-        """Poll CI status for all tracked PRs."""
+        """Poll CI status for tracked PRs + nvidia ping / owner rerun for all open PRs."""
         await ci_monitor.poll_all_tracked_prs()
+        await ci_monitor.poll_all_open_prs()
 
     async def poll_tracked_pr_summary() -> None:
         """Generate periodic summaries for tracked PRs."""
@@ -218,7 +220,7 @@ def _make_hp_nvidia_handler(gh, settings):
     async def handler(pr_number, user_ids, review_state):
         await gh.create_issue_comment(
             pr_number,
-            f"@{settings.ci_high_priority_ping_user} Nvidia CI passed and PR is approved, ready for merge",
+            f"@{settings.ci_high_priority_ping_user} Nvidia CI passed and PR is approved, ready for merge\n\n_— SGLDHelper bot_",
         )
     return handler
 

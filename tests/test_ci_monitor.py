@@ -253,14 +253,13 @@ class TestHighPriority:
         assert ci_monitor._nvidia_ci_passed(ci_status) is True
 
     @pytest.mark.asyncio
-    async def test_high_priority_github_ping_triggered(self, ci_monitor, mock_gh, db, settings):
-        """Should trigger callback when nvidia passed + approved + high-priority."""
-        # Set up PR with high-priority label
+    async def test_nvidia_passed_github_ping_triggered(self, ci_monitor, mock_gh, db, settings):
+        """Should trigger callback when nvidia passed + approved (no high-priority label needed)."""
         mock_gh.get_pull = AsyncMock(return_value={
             "number": 19876,
             "state": "open",
             "head": {"sha": "abc123def456"},
-            "labels": [{"name": "run-ci"}, {"name": "high-priority"}],
+            "labels": [{"name": "run-ci"}],
             "user": {"login": "alice"},
         })
         # Nvidia CI passed
@@ -288,13 +287,13 @@ class TestHighPriority:
         hp_callback.assert_called_once_with(19876, ["U123"], "approved")
 
     @pytest.mark.asyncio
-    async def test_high_priority_no_duplicate_ping(self, ci_monitor, mock_gh, db, settings):
+    async def test_nvidia_passed_no_duplicate_ping(self, ci_monitor, mock_gh, db, settings):
         """Should NOT ping a second time on the next poll for the same SHA."""
         mock_gh.get_pull = AsyncMock(return_value={
             "number": 19876,
             "state": "open",
             "head": {"sha": "abc123def456"},
-            "labels": [{"name": "run-ci"}, {"name": "high-priority"}],
+            "labels": [{"name": "run-ci"}],
             "user": {"login": "alice"},
         })
         mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
@@ -323,3 +322,77 @@ class TestHighPriority:
         # Second poll — should NOT ping again
         await ci_monitor._poll_single_pr(19876, ["U123"])
         assert hp_callback.call_count == 1
+
+
+class TestOwnerRerun:
+    """Tests for auto-retry when owner (mickqian) commented /tag-and-rerun-ci."""
+
+    def _setup_failed_ci(self, mock_gh, settings, *, with_owner_comment=True):
+        """Set up mocks for a PR with failed CI."""
+        mock_gh.get_pull = AsyncMock(return_value={
+            "number": 19876,
+            "state": "open",
+            "head": {"sha": "abc123def456"},
+            "labels": [{"name": "run-ci"}],
+            "user": {"login": "alice"},
+        })
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+            {
+                "id": 1,
+                "workflow_id": settings.ci_nvidia_workflow_id,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ])
+        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
+            {"name": "test-gpu", "status": "completed", "conclusion": "failure", "id": 10},
+        ])
+        comments = []
+        if with_owner_comment:
+            comments.append({
+                "user": {"login": settings.ci_high_priority_ping_user},
+                "body": "/tag-and-rerun-ci",
+            })
+        mock_gh.get_issue_comments = AsyncMock(return_value=comments)
+
+    @pytest.mark.asyncio
+    async def test_owner_rerun_triggers_retry(self, ci_monitor, mock_gh, db, settings):
+        """Should auto-retry when owner commented /tag-and-rerun-ci."""
+        self._setup_failed_ci(mock_gh, settings)
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.rerun_failed_jobs.assert_called_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_owner_rerun_no_comment_no_retry(self, ci_monitor, mock_gh, db, settings):
+        """Should NOT retry when owner has not commented."""
+        self._setup_failed_ci(mock_gh, settings, with_owner_comment=False)
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.rerun_failed_jobs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_owner_rerun_respects_max_retries(self, ci_monitor, mock_gh, db, settings):
+        """Should stop retrying after ci_owner_rerun_max_retries."""
+        from sgldhelper.db import queries
+
+        self._setup_failed_ci(mock_gh, settings)
+
+        # Exhaust retries
+        for _ in range(settings.ci_owner_rerun_max_retries):
+            await queries.increment_ci_retry(db.conn, 19876, "abc123def456", "test-gpu")
+
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.rerun_failed_jobs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_owner_rerun_caches_comment_check(self, ci_monitor, mock_gh, db, settings):
+        """Should only fetch comments once per SHA (cached in snapshot_data)."""
+        self._setup_failed_ci(mock_gh, settings)
+
+        # First call — fetches comments
+        await ci_monitor._check_untracked_pr(19876)
+        assert mock_gh.get_issue_comments.call_count == 1
+
+        # Second call — uses cached value
+        mock_gh.rerun_failed_jobs.reset_mock()
+        await ci_monitor._check_untracked_pr(19876)
+        assert mock_gh.get_issue_comments.call_count == 1  # Still 1, cached

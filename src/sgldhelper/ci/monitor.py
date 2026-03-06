@@ -67,6 +67,7 @@ class CIMonitor:
         self._on_ci_failed_retrying: Any = None
         self._on_ci_failed_permanent: Any = None
         self._on_high_priority_nvidia_passed: Any = None
+        self._is_merge_pending: Any = None
 
     def set_callbacks(
         self,
@@ -76,12 +77,14 @@ class CIMonitor:
         on_ci_failed_permanent: Any = None,
         on_merge_ready_check: Any = None,
         on_high_priority_nvidia_passed: Any = None,
+        is_merge_pending: Any = None,
     ) -> None:
         self._on_ci_passed = on_ci_passed
         self._on_ci_failed_retrying = on_ci_failed_retrying
         self._on_ci_failed_permanent = on_ci_failed_permanent
         self._on_merge_ready_check = on_merge_ready_check
         self._on_high_priority_nvidia_passed = on_high_priority_nvidia_passed
+        self._is_merge_pending = is_merge_pending
 
     async def check_pr_ci(
         self,
@@ -281,6 +284,158 @@ class CIMonitor:
             except Exception:
                 log.exception("ci_monitor.poll_error", pr=pr_number)
 
+    async def poll_all_open_prs(self) -> None:
+        """Check all open diffusion PRs (not tracked) for:
+
+        1. Nvidia-passed + approved → ping
+        2. Owner-rerun: mickqian commented /tag-and-rerun-ci → auto-retry on failure
+
+        Tracked PRs are already covered by ``_poll_single_pr``.
+        """
+        tracked = await queries.get_all_tracked_prs(self._db.conn)
+        tracked_set = set(tracked.keys()) if tracked else set()
+
+        open_prs = await queries.get_open_prs(self._db.conn)
+        for db_pr in open_prs:
+            pr_number = db_pr["pr_number"]
+            if pr_number in tracked_set:
+                continue
+            try:
+                await self._check_untracked_pr(pr_number)
+            except Exception:
+                log.exception("ci_monitor.untracked_pr_error", pr=pr_number)
+
+    async def _check_untracked_pr(self, pr_number: int) -> None:
+        """Check an untracked PR for nvidia ping and owner-rerun retry."""
+        try:
+            pr_data = await self._gh.get_pull(pr_number)
+        except Exception:
+            return
+
+        if pr_data["state"] != "open":
+            return
+
+        head_sha = pr_data["head"]["sha"]
+        ci_status = await self.check_pr_ci(pr_number, head_sha, pr_data=pr_data)
+
+        # --- Nvidia ping ---
+        if self._on_high_priority_nvidia_passed:
+            await self._maybe_nvidia_ping(pr_number, head_sha, ci_status)
+
+        # --- Owner rerun: auto-retry on failure ---
+        if (
+            ci_status.overall == CIOverallStatus.FAILED
+            and ci_status.all_runs_completed
+            and ci_status.has_run_ci_label
+        ):
+            await self._maybe_owner_rerun(pr_number, head_sha, ci_status)
+
+    async def _maybe_nvidia_ping(
+        self, pr_number: int, head_sha: str, ci_status: CIStatus
+    ) -> None:
+        """Ping once when nvidia passed + approved (untracked PRs)."""
+        if not self._nvidia_ci_passed(ci_status):
+            return
+
+        reviews = await self._gh.get_pull_reviews(pr_number)
+        review_state = "none"
+        for r in reviews:
+            if r.get("state") == "APPROVED":
+                review_state = "approved"
+                break
+
+        if review_state != "approved":
+            return
+
+        if self._is_merge_pending and self._is_merge_pending(pr_number):
+            return
+
+        prev_snapshot = await queries.get_ci_snapshot(self._db.conn, pr_number, head_sha)
+        snapshot_data = self._load_snapshot_data(prev_snapshot)
+
+        if snapshot_data.get("hp_nvidia_pinged"):
+            return
+
+        await self._on_high_priority_nvidia_passed(pr_number, [], review_state)
+        snapshot_data["hp_nvidia_pinged"] = True
+        failed_names = [j.job_name for j in ci_status.failed_jobs]
+        await queries.upsert_ci_snapshot(
+            self._db.conn,
+            pr_number,
+            head_sha,
+            overall_status=ci_status.overall.value,
+            has_run_ci_label=ci_status.has_run_ci_label,
+            failed_jobs=json.dumps(failed_names),
+            review_state=review_state,
+            snapshot_data=json.dumps(snapshot_data),
+        )
+
+    async def _maybe_owner_rerun(
+        self, pr_number: int, head_sha: str, ci_status: CIStatus
+    ) -> None:
+        """Auto-retry failed CI if the owner (ci_high_priority_ping_user) has
+        commented /tag-and-rerun-ci on this PR. Max ci_owner_rerun_max_retries."""
+        owner = self._settings.ci_high_priority_ping_user
+
+        # Check snapshot_data cache first to avoid re-fetching comments
+        prev_snapshot = await queries.get_ci_snapshot(self._db.conn, pr_number, head_sha)
+        snapshot_data = self._load_snapshot_data(prev_snapshot)
+
+        # Cache whether owner commented /tag-and-rerun-ci (per SHA)
+        if "owner_rerun" not in snapshot_data:
+            comments = await self._gh.get_issue_comments(pr_number)
+            has_owner_rerun = any(
+                c.get("user", {}).get("login") == owner
+                and "/tag-and-rerun-ci" in (c.get("body") or "")
+                for c in comments
+            )
+            snapshot_data["owner_rerun"] = has_owner_rerun
+            await queries.upsert_ci_snapshot(
+                self._db.conn,
+                pr_number,
+                head_sha,
+                overall_status=ci_status.overall.value,
+                has_run_ci_label=ci_status.has_run_ci_label,
+                failed_jobs=json.dumps([j.job_name for j in ci_status.failed_jobs]),
+                snapshot_data=json.dumps(snapshot_data),
+            )
+
+        if not snapshot_data["owner_rerun"]:
+            return
+
+        # Retry failed jobs up to ci_owner_rerun_max_retries
+        max_retries = self._settings.ci_owner_rerun_max_retries
+        rerun_ids: set[int] = set()
+        for job in ci_status.failed_jobs:
+            count = await queries.get_ci_retry_count(
+                self._db.conn, pr_number, head_sha, job.job_name
+            )
+            if count < max_retries:
+                if job.run_id not in rerun_ids:
+                    try:
+                        await self._gh.rerun_failed_jobs(job.run_id)
+                        rerun_ids.add(job.run_id)
+                    except Exception:
+                        log.exception("ci_monitor.owner_rerun_failed",
+                                      pr=pr_number, run_id=job.run_id)
+                await queries.increment_ci_retry(
+                    self._db.conn, pr_number, head_sha, job.job_name
+                )
+
+        if rerun_ids:
+            log.info("ci_monitor.owner_rerun_triggered",
+                     pr=pr_number, run_ids=list(rerun_ids), owner=owner)
+
+    @staticmethod
+    def _load_snapshot_data(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+        """Load snapshot_data JSON from a ci_snapshot row."""
+        if snapshot and snapshot.get("snapshot_data"):
+            try:
+                return json.loads(snapshot["snapshot_data"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {}
+
     async def _poll_single_pr(self, pr_number: int, user_ids: list[str]) -> None:
         """Poll CI status for a single tracked PR."""
         # Get current PR info
@@ -331,20 +486,17 @@ class CIMonitor:
             commit_count=commit_count,
         )
 
-        # --- High-priority: Nvidia passed + approved → ping (once) ---
+        # --- Nvidia passed + approved → ping (once) ---
+        # Skip if auto-merge is already pending for this PR
+        merge_pending = self._is_merge_pending and self._is_merge_pending(pr_number)
         if (
-            ci_status.has_high_priority_label
-            and self._nvidia_ci_passed(ci_status)
+            self._nvidia_ci_passed(ci_status)
             and review_state == "approved"
             and self._on_high_priority_nvidia_passed
+            and not merge_pending
         ):
             # Check snapshot_data to avoid duplicate pings
-            snapshot_data: dict[str, Any] = {}
-            if prev_snapshot and prev_snapshot.get("snapshot_data"):
-                try:
-                    snapshot_data = json.loads(prev_snapshot["snapshot_data"])
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            snapshot_data = self._load_snapshot_data(prev_snapshot)
             if not snapshot_data.get("hp_nvidia_pinged"):
                 await self._on_high_priority_nvidia_passed(pr_number, user_ids, review_state)
                 snapshot_data["hp_nvidia_pinged"] = True
