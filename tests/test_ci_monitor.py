@@ -232,16 +232,31 @@ class TestHighPriority:
         assert await ci_monitor.should_retry(19876, "abc123", job, is_high_priority=True) is False
 
     @pytest.mark.asyncio
-    async def test_nvidia_ci_passed_helper(self, ci_monitor):
-        """_nvidia_ci_passed returns True when all nvidia jobs pass, even if AMD fails."""
-        ci_status = CIStatus(
+    async def test_all_ci_passed_helper(self, ci_monitor):
+        """_all_ci_passed returns True only when both nvidia AND amd jobs pass."""
+        # Both pass → True
+        ci_both_pass = CIStatus(
+            pr_number=19876,
+            head_sha="abc123",
+            overall=CIOverallStatus.PASSED,
+            has_run_ci_label=True,
+            nvidia_jobs=[
+                CIJobResult("build", "nvidia", "completed", "success", 1, 10),
+            ],
+            amd_jobs=[
+                CIJobResult("build", "amd", "completed", "success", 2, 20),
+            ],
+        )
+        assert ci_monitor._all_ci_passed(ci_both_pass) is True
+
+        # Nvidia pass, AMD fail → False
+        ci_amd_fail = CIStatus(
             pr_number=19876,
             head_sha="abc123",
             overall=CIOverallStatus.FAILED,
             has_run_ci_label=True,
             nvidia_jobs=[
                 CIJobResult("build", "nvidia", "completed", "success", 1, 10),
-                CIJobResult("test", "nvidia", "completed", "success", 1, 11),
             ],
             amd_jobs=[
                 CIJobResult("build", "amd", "completed", "failure", 2, 20),
@@ -250,11 +265,24 @@ class TestHighPriority:
                 CIJobResult("build", "amd", "completed", "failure", 2, 20),
             ],
         )
-        assert ci_monitor._nvidia_ci_passed(ci_status) is True
+        assert ci_monitor._all_ci_passed(ci_amd_fail) is False
+
+        # Nvidia pass, no AMD jobs → False
+        ci_no_amd = CIStatus(
+            pr_number=19876,
+            head_sha="abc123",
+            overall=CIOverallStatus.PASSED,
+            has_run_ci_label=True,
+            nvidia_jobs=[
+                CIJobResult("build", "nvidia", "completed", "success", 1, 10),
+            ],
+            amd_jobs=[],
+        )
+        assert ci_monitor._all_ci_passed(ci_no_amd) is False
 
     @pytest.mark.asyncio
-    async def test_nvidia_passed_github_ping_triggered(self, ci_monitor, mock_gh, db, settings):
-        """Should trigger callback when nvidia passed + approved (no high-priority label needed)."""
+    async def test_all_ci_passed_github_ping_triggered(self, ci_monitor, mock_gh, db, settings):
+        """Should trigger callback when both nvidia+amd passed + approved."""
         mock_gh.get_pull = AsyncMock(return_value={
             "number": 19876,
             "state": "open",
@@ -262,32 +290,30 @@ class TestHighPriority:
             "labels": [{"name": "run-ci"}],
             "user": {"login": "alice"},
         })
-        # Nvidia CI passed
+        # Both Nvidia and AMD CI passed
         mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
-            {
-                "id": 1,
-                "workflow_id": settings.ci_nvidia_workflow_id,
-                "status": "completed",
-                "conclusion": "success",
-            },
+            {"id": 1, "workflow_id": settings.ci_nvidia_workflow_id,
+             "status": "completed", "conclusion": "success"},
+            {"id": 2, "workflow_id": settings.ci_amd_workflow_id,
+             "status": "completed", "conclusion": "success"},
         ])
-        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
-            {"name": "build", "status": "completed", "conclusion": "success", "id": 10},
+        mock_gh.get_workflow_run_jobs = AsyncMock(side_effect=[
+            [{"name": "build", "status": "completed", "conclusion": "success", "id": 10}],
+            [{"name": "build", "status": "completed", "conclusion": "success", "id": 20}],
         ])
-        # Approved
         mock_gh.get_pull_reviews = AsyncMock(return_value=[
             {"state": "APPROVED", "user": {"login": "reviewer"}},
         ])
         mock_gh.get_pull_commits = AsyncMock(return_value=[{"sha": "abc123def456"}])
 
         hp_callback = AsyncMock()
-        ci_monitor.set_callbacks(on_high_priority_nvidia_passed=hp_callback)
+        ci_monitor.set_callbacks(on_ci_passed_approved=hp_callback)
 
         await ci_monitor._poll_single_pr(19876, ["U123"])
         hp_callback.assert_called_once_with(19876, ["U123"], "approved")
 
     @pytest.mark.asyncio
-    async def test_nvidia_passed_no_duplicate_ping(self, ci_monitor, mock_gh, db, settings):
+    async def test_all_ci_passed_no_duplicate_ping(self, ci_monitor, mock_gh, db, settings):
         """Should NOT ping a second time on the next poll for the same SHA."""
         mock_gh.get_pull = AsyncMock(return_value={
             "number": 19876,
@@ -297,15 +323,14 @@ class TestHighPriority:
             "user": {"login": "alice"},
         })
         mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
-            {
-                "id": 1,
-                "workflow_id": settings.ci_nvidia_workflow_id,
-                "status": "completed",
-                "conclusion": "success",
-            },
+            {"id": 1, "workflow_id": settings.ci_nvidia_workflow_id,
+             "status": "completed", "conclusion": "success"},
+            {"id": 2, "workflow_id": settings.ci_amd_workflow_id,
+             "status": "completed", "conclusion": "success"},
         ])
-        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
-            {"name": "build", "status": "completed", "conclusion": "success", "id": 10},
+        mock_gh.get_workflow_run_jobs = AsyncMock(side_effect=[
+            [{"name": "build", "status": "completed", "conclusion": "success", "id": 10}],
+            [{"name": "build", "status": "completed", "conclusion": "success", "id": 20}],
         ])
         mock_gh.get_pull_reviews = AsyncMock(return_value=[
             {"state": "APPROVED", "user": {"login": "reviewer"}},
@@ -313,13 +338,17 @@ class TestHighPriority:
         mock_gh.get_pull_commits = AsyncMock(return_value=[{"sha": "abc123def456"}])
 
         hp_callback = AsyncMock()
-        ci_monitor.set_callbacks(on_high_priority_nvidia_passed=hp_callback)
+        ci_monitor.set_callbacks(on_ci_passed_approved=hp_callback)
 
         # First poll — should ping
         await ci_monitor._poll_single_pr(19876, ["U123"])
         assert hp_callback.call_count == 1
 
-        # Second poll — should NOT ping again
+        # Second poll — need to re-mock side_effect for get_workflow_run_jobs
+        mock_gh.get_workflow_run_jobs = AsyncMock(side_effect=[
+            [{"name": "build", "status": "completed", "conclusion": "success", "id": 10}],
+            [{"name": "build", "status": "completed", "conclusion": "success", "id": 20}],
+        ])
         await ci_monitor._poll_single_pr(19876, ["U123"])
         assert hp_callback.call_count == 1
 

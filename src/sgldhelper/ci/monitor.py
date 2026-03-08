@@ -66,7 +66,7 @@ class CIMonitor:
         self._on_ci_passed: Any = None
         self._on_ci_failed_retrying: Any = None
         self._on_ci_failed_permanent: Any = None
-        self._on_high_priority_nvidia_passed: Any = None
+        self._on_ci_passed_approved: Any = None
         self._is_merge_pending: Any = None
 
     def set_callbacks(
@@ -76,14 +76,14 @@ class CIMonitor:
         on_ci_failed_retrying: Any = None,
         on_ci_failed_permanent: Any = None,
         on_merge_ready_check: Any = None,
-        on_high_priority_nvidia_passed: Any = None,
+        on_ci_passed_approved: Any = None,
         is_merge_pending: Any = None,
     ) -> None:
         self._on_ci_passed = on_ci_passed
         self._on_ci_failed_retrying = on_ci_failed_retrying
         self._on_ci_failed_permanent = on_ci_failed_permanent
         self._on_merge_ready_check = on_merge_ready_check
-        self._on_high_priority_nvidia_passed = on_high_priority_nvidia_passed
+        self._on_ci_passed_approved = on_ci_passed_approved
         self._is_merge_pending = is_merge_pending
 
     async def check_pr_ci(
@@ -183,13 +183,13 @@ class CIMonitor:
             has_high_priority_label=has_high_priority,
         )
 
-    def _nvidia_ci_passed(self, ci_status: CIStatus) -> bool:
-        """Check if all Nvidia CI jobs passed (ignores AMD)."""
-        if not ci_status.nvidia_jobs:
+    def _all_ci_passed(self, ci_status: CIStatus) -> bool:
+        """Check if both Nvidia AND AMD CI jobs passed."""
+        if not ci_status.nvidia_jobs or not ci_status.amd_jobs:
             return False
         return all(
             j.status == "completed" and j.conclusion == "success"
-            for j in ci_status.nvidia_jobs
+            for j in ci_status.nvidia_jobs + ci_status.amd_jobs
         )
 
     async def should_retry(
@@ -290,7 +290,7 @@ class CIMonitor:
     async def poll_all_open_prs(self) -> None:
         """Check all open diffusion PRs (not tracked) for:
 
-        1. Nvidia-passed + approved → ping
+        1. All CI passed + approved → ping
         2. Owner-rerun: mickqian commented /tag-and-rerun-ci → auto-retry on failure
 
         Tracked PRs are already covered by ``_poll_single_pr``.
@@ -309,7 +309,7 @@ class CIMonitor:
                 log.exception("ci_monitor.untracked_pr_error", pr=pr_number)
 
     async def _check_untracked_pr(self, pr_number: int) -> None:
-        """Check an untracked PR for nvidia ping and owner-rerun retry."""
+        """Check an untracked PR for CI-passed ping and owner-rerun retry."""
         try:
             pr_data = await self._gh.get_pull(pr_number)
         except Exception:
@@ -321,9 +321,9 @@ class CIMonitor:
         head_sha = pr_data["head"]["sha"]
         ci_status = await self.check_pr_ci(pr_number, head_sha, pr_data=pr_data)
 
-        # --- Nvidia ping ---
-        if self._on_high_priority_nvidia_passed:
-            await self._maybe_nvidia_ping(pr_number, head_sha, ci_status)
+        # --- All CI passed + approved → ping ---
+        if self._on_ci_passed_approved:
+            await self._maybe_ci_ping(pr_number, head_sha, ci_status)
 
         # --- Approve auto-CI: start or retry CI when approved by configured users ---
         await self._maybe_approve_auto_ci(pr_number, head_sha, ci_status)
@@ -336,11 +336,11 @@ class CIMonitor:
         ):
             await self._maybe_owner_rerun(pr_number, head_sha, ci_status)
 
-    async def _maybe_nvidia_ping(
+    async def _maybe_ci_ping(
         self, pr_number: int, head_sha: str, ci_status: CIStatus
     ) -> None:
-        """Ping once when nvidia passed + approved (untracked PRs)."""
-        if not self._nvidia_ci_passed(ci_status):
+        """Ping once when all CI passed + approved (untracked PRs)."""
+        if not self._all_ci_passed(ci_status):
             return
 
         reviews = await self._gh.get_pull_reviews(pr_number)
@@ -362,7 +362,7 @@ class CIMonitor:
         if snapshot_data.get("hp_nvidia_pinged"):
             return
 
-        await self._on_high_priority_nvidia_passed(pr_number, [], review_state)
+        await self._on_ci_passed_approved(pr_number, [], review_state)
         snapshot_data["hp_nvidia_pinged"] = True
         failed_names = [j.job_name for j in ci_status.failed_jobs]
         await queries.upsert_ci_snapshot(
@@ -552,19 +552,19 @@ class CIMonitor:
         # --- Approve auto-CI: start or retry CI when approved by configured users ---
         await self._maybe_approve_auto_ci(pr_number, head_sha, ci_status)
 
-        # --- Nvidia passed + approved → ping (once) ---
+        # --- All CI passed + approved → ping (once) ---
         # Skip if auto-merge is already pending for this PR
         merge_pending = self._is_merge_pending and self._is_merge_pending(pr_number)
         if (
-            self._nvidia_ci_passed(ci_status)
+            self._all_ci_passed(ci_status)
             and review_state == "approved"
-            and self._on_high_priority_nvidia_passed
+            and self._on_ci_passed_approved
             and not merge_pending
         ):
             # Check snapshot_data to avoid duplicate pings
             snapshot_data = self._load_snapshot_data(prev_snapshot)
             if not snapshot_data.get("hp_nvidia_pinged"):
-                await self._on_high_priority_nvidia_passed(pr_number, user_ids, review_state)
+                await self._on_ci_passed_approved(pr_number, user_ids, review_state)
                 snapshot_data["hp_nvidia_pinged"] = True
                 await queries.upsert_ci_snapshot(
                     self._db.conn,

@@ -68,7 +68,7 @@ async def _run() -> None:
         on_ci_failed_retrying=dispatcher.ci.notify_ci_failed_retrying,
         on_ci_failed_permanent=dispatcher.ci.notify_ci_failed_permanent,
         on_merge_ready_check=_make_merge_ready_handler(auto_merge),
-        on_high_priority_nvidia_passed=_make_hp_nvidia_handler(gh, settings),
+        on_ci_passed_approved=_make_hp_nvidia_handler(gh, settings),
         is_merge_pending=auto_merge.is_pending,
     )
     auto_merge.set_callbacks(
@@ -199,11 +199,11 @@ async def _run() -> None:
 
 
 def _make_hp_nvidia_handler(gh, settings):
-    """Create a callback that pings on GitHub when Nvidia CI passes for high-priority PRs."""
+    """Create a callback that pings on GitHub when all CI passes + PR approved."""
     async def handler(pr_number, user_ids, review_state):
         await gh.create_issue_comment(
             pr_number,
-            f"@{settings.ci_high_priority_ping_user} Nvidia CI passed and PR is approved, ready for merge\n\n_— SGLDHelper bot_",
+            f"@{settings.ci_high_priority_ping_user} All CI (Nvidia + AMD) passed and PR is approved, ready for merge\n\n_— SGLDHelper bot_",
         )
     return handler
 
