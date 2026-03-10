@@ -434,7 +434,7 @@ class CIMonitor:
         self, pr_number: int, head_sha: str, ci_status: CIStatus,
     ) -> None:
         """If an approved-by user (mickqian/bbuf) approved this PR:
-        - No run-ci label → comment /tag-and-rerun-ci to start CI
+        - Always comment /tag-and-rerun-ci (once per SHA)
         - CI failed → comment /rerun-failed-ci (up to ci_approve_auto_ci_max_retries)
         """
         # Check if any configured user approved
@@ -444,12 +444,10 @@ class CIMonitor:
         if not approved_users & auto_ci_users:
             return
 
-        # Case 1: No run-ci label → start CI
-        if not ci_status.has_run_ci_label:
-            snapshot = await queries.get_ci_snapshot(self._db.conn, pr_number, head_sha)
-            snapshot_data = self._load_snapshot_data(snapshot)
-            if snapshot_data.get("approve_auto_ci_started"):
-                return  # Already commented once for this SHA
+        # Always comment /tag-and-rerun-ci once per SHA on first approval
+        snapshot = await queries.get_ci_snapshot(self._db.conn, pr_number, head_sha)
+        snapshot_data = self._load_snapshot_data(snapshot)
+        if not snapshot_data.get("approve_auto_ci_started"):
             try:
                 await self._gh.create_issue_comment(pr_number, "/tag-and-rerun-ci")
                 log.info("ci_monitor.approve_auto_ci_started", pr=pr_number)
@@ -464,9 +462,9 @@ class CIMonitor:
                 failed_jobs=json.dumps([j.job_name for j in ci_status.failed_jobs]),
                 snapshot_data=json.dumps(snapshot_data),
             )
-            return
+            return  # CI just kicked off; skip retry logic this poll
 
-        # Case 2: CI failed → retry
+        # CI failed → retry (only after initial /tag-and-rerun-ci was already posted)
         if (
             ci_status.overall == CIOverallStatus.FAILED
             and ci_status.all_runs_completed

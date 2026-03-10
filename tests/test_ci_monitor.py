@@ -480,17 +480,26 @@ class TestApproveAutoCI:
 
     @pytest.mark.asyncio
     async def test_ci_failed_retries(self, ci_monitor, mock_gh, db, settings):
-        """When approved and CI failed, comment /rerun-failed-ci."""
+        """When approved and CI failed: first poll posts /tag-and-rerun-ci,
+        second poll posts /rerun-failed-ci."""
         self._setup_pr(mock_gh, settings, has_label=True, ci_failed=True)
+        # First poll: always comment /tag-and-rerun-ci on first approval
+        await ci_monitor._check_untracked_pr(19876)
+        mock_gh.create_issue_comment.assert_called_once_with(19876, "/tag-and-rerun-ci")
+        # Second poll: initial comment already posted, CI still failed → retry
+        mock_gh.create_issue_comment.reset_mock()
         await ci_monitor._check_untracked_pr(19876)
         mock_gh.create_issue_comment.assert_called_once_with(19876, "/rerun-failed-ci")
 
     @pytest.mark.asyncio
     async def test_ci_failed_respects_max_retries(self, ci_monitor, mock_gh, db, settings):
-        """Should stop retrying after ci_approve_auto_ci_max_retries."""
+        """Should stop retrying after ci_approve_auto_ci_max_retries (after initial comment)."""
         from sgldhelper.db import queries
 
         self._setup_pr(mock_gh, settings, has_label=True, ci_failed=True)
+        # Simulate that /tag-and-rerun-ci was already posted and retries are exhausted
+        await ci_monitor._check_untracked_pr(19876)  # posts /tag-and-rerun-ci
+        mock_gh.create_issue_comment.reset_mock()
         for _ in range(settings.ci_approve_auto_ci_max_retries):
             await queries.increment_ci_retry(db.conn, 19876, "abc123def456", "build")
 
