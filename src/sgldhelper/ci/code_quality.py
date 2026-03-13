@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Awaitable
 
@@ -44,8 +47,48 @@ _CODE_QUALITY_SYSTEM_PROMPT = (
     "- *Daily Overall Score*: weighted average (0-10) of all PR scores\n"
     "- *Key Takeaways*: 1-3 bullet points on today's overall code quality trend\n\n"
     "Be concise. Each PR review should be 3-5 lines max.\n"
-    "Use Chinese for commentary, English for technical terms.\n"
+    "Use Chinese for commentary, English for technical terms.\n\n"
+    "CRITICAL: At the very end of your response, on its own line, output a machine-readable "
+    "JSON object (and NOTHING else on that line) in this exact format:\n"
+    '<!--SCORES:{"overall":N,"prs":[{"pr":PR_NUMBER,"score":N,"reason":"one-line reason if score<=3"},...]}-->\n'
+    "This line will be stripped before display. It MUST be the last line.\n"
 )
+
+
+@dataclass
+class QualityReport:
+    """Parsed result of a code quality report."""
+
+    display_text: str
+    overall_score: float | None = None
+    pr_scores: list[dict[str, Any]] = field(default_factory=list)
+    alert_prs: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _parse_report(raw: str, threshold: int) -> QualityReport:
+    """Parse LLM output, extracting the SCORES JSON and the display text."""
+    # Look for the <!--SCORES:{...}--> line
+    match = re.search(r"<!--SCORES:(\{.*?\})-->", raw)
+    if not match:
+        return QualityReport(display_text=raw.strip())
+
+    display_text = raw[:match.start()].rstrip("\n ")
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        log.warning("code_quality.scores_json_parse_failed", raw=match.group(1)[:200])
+        return QualityReport(display_text=display_text)
+
+    overall = data.get("overall")
+    pr_scores = data.get("prs", [])
+    alert_prs = [p for p in pr_scores if isinstance(p.get("score"), (int, float)) and p["score"] <= threshold]
+
+    return QualityReport(
+        display_text=display_text,
+        overall_score=overall,
+        pr_scores=pr_scores,
+        alert_prs=alert_prs,
+    )
 
 
 class CodeQualityReporter:
@@ -91,14 +134,22 @@ class CodeQualityReporter:
             return
 
         if report and self._on_report:
-            await self._on_report(report, len(merged_prs))
+            await self._on_report(
+                report.display_text, len(merged_prs), report.alert_prs,
+            )
 
         self._last_report_date = today
-        log.info("code_quality.report_posted", date=today, pr_count=len(merged_prs))
+        log.info(
+            "code_quality.report_posted",
+            date=today,
+            pr_count=len(merged_prs),
+            overall_score=report.overall_score if report else None,
+            alerts=len(report.alert_prs) if report else 0,
+        )
 
     async def _generate_report(
         self, merged_prs: list[dict[str, Any]]
-    ) -> str | None:
+    ) -> QualityReport | None:
         """Fetch diffs and generate a quality report via LLM."""
         pr_contexts: list[str] = []
 
@@ -141,4 +192,7 @@ class CodeQualityReporter:
             tokens_in, tokens_out,
         )
 
-        return response.choices[0].message.content or None
+        raw = response.choices[0].message.content
+        if not raw:
+            return None
+        return _parse_report(raw, self._settings.code_quality_alert_threshold)
