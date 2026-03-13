@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     # Code quality report poll interval (seconds), default 1 hour
     # The report runs at most once per day; this is how often we check if it's time
     code_quality_poll_interval: int = 3600
+    # PR score at or below this threshold triggers an @mention alert
+    code_quality_alert_threshold: int = 3
+    # Slack user IDs to @mention when a critically bad PR is detected
+    code_quality_alert_user_ids: list[str] = Field(default=[])
 
     # Diffusion file path prefixes — only multimodal_gen, NOT diffusion-llm
     diffusion_paths: list[str] = Field(
