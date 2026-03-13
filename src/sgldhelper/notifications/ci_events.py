@@ -103,6 +103,13 @@ class CIEventHandler:
         msg = messages.build_merge_cancelled(pr_number, user_ids, self._settings.github_repo)
         await self._post(msg)
 
+    async def notify_code_quality_report(
+        self, report: str, pr_count: int
+    ) -> None:
+        msg = messages.build_code_quality_report(report, pr_count)
+        await self._post(msg)
+        log.info("notification.code_quality_report", pr_count=pr_count)
+
     async def notify_tracked_pr_summary(
         self, pr_number: int, user_ids: list[str], summary: str
     ) -> None:

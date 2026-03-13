@@ -29,6 +29,7 @@ from sgldhelper.ci.monitor import CIMonitor
 from sgldhelper.ci.auto_merge import AutoMergeManager
 from sgldhelper.ci.tracked_pr_summary import TrackedPRSummaryGenerator
 from sgldhelper.ci.health_check import PRHealthChecker
+from sgldhelper.ci.code_quality import CodeQualityReporter
 
 
 async def _run() -> None:
@@ -93,6 +94,10 @@ async def _run() -> None:
     tracked_pr_summary = TrackedPRSummaryGenerator(kimi, gh, db, settings)
     tracked_pr_summary.set_callback(dispatcher.ci.notify_tracked_pr_summary)
 
+    # --- Code quality reporter ---
+    code_quality = CodeQualityReporter(kimi, gh, db, settings)
+    code_quality.set_callback(dispatcher.ci.notify_code_quality_report)
+
     register_handlers(
         slack_app, db, channels, settings,
         conversation_manager=conversation_manager,
@@ -148,6 +153,10 @@ async def _run() -> None:
         """Periodic health check of all open diffusion PRs."""
         await health_checker.poll()
 
+    async def poll_code_quality() -> None:
+        """Daily code quality report for merged diffusion PRs."""
+        await code_quality.poll()
+
     pollers: list[Poller] = []
 
     # Pollers work with public repos even without GITHUB_TOKEN (lower rate limit)
@@ -162,9 +171,12 @@ async def _run() -> None:
     health_check_poller = Poller(
         "health_check", settings.pr_health_check_interval, poll_health_check
     )
+    code_quality_poller = Poller(
+        "code_quality", settings.code_quality_poll_interval, poll_code_quality
+    )
     pollers.extend([
         pr_poller, ci_poller, tracked_summary_poller,
-        diffusion_summary_poller, health_check_poller,
+        diffusion_summary_poller, health_check_poller, code_quality_poller,
     ])
 
     # --- Graceful shutdown ---
