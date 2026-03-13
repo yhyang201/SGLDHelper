@@ -337,6 +337,27 @@ def build_tracked_pr_summary(
 # AI-related messages
 # ---------------------------------------------------------------------------
 
+def build_code_quality_report(report: str, pr_count: int) -> dict[str, Any]:
+    """Build a daily code quality report message."""
+    text = f"Daily Code Quality Report ({pr_count} PRs)"
+    return {
+        "text": text,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":mag: *Daily Code Quality Report*\n"
+                        f"_{pr_count} diffusion PR(s) merged today_\n\n"
+                        f"{report}"
+                    ),
+                },
+            },
+        ],
+    }
+
+
 def build_progress_confirmation(result: dict[str, Any]) -> dict[str, Any]:
     """Build a confirmation message for a detected progress update or blocker."""
     category = result.get("category", "update")

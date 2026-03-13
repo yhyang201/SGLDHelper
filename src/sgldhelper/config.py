@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     # PR health check interval (seconds), default 2 hours
     pr_health_check_interval: int = 7200
 
+    # Code quality report poll interval (seconds), default 1 hour
+    # The report runs at most once per day; this is how often we check if it's time
+    code_quality_poll_interval: int = 3600
+
     # Diffusion file path prefixes — only multimodal_gen, NOT diffusion-llm
     diffusion_paths: list[str] = Field(
         default=[

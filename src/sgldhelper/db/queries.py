@@ -585,3 +585,16 @@ async def remove_tracked_pr_all_users(
     if affected:
         await conn.commit()
     return affected
+
+
+async def get_merged_diffusion_prs_today(
+    conn: aiosqlite.Connection,
+) -> list[dict[str, Any]]:
+    """Return diffusion PRs merged today (UTC)."""
+    cur = await conn.execute(
+        """SELECT * FROM pull_requests
+        WHERE state = 'merged'
+          AND date(updated_at) = date('now')
+        ORDER BY pr_number DESC""",
+    )
+    return [dict(r) for r in await cur.fetchall()]
