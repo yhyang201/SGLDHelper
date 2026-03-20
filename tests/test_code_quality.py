@@ -12,7 +12,7 @@ from sgldhelper.db import queries
 
 @pytest.fixture
 def mock_kimi():
-    kimi = AsyncMock()
+    kimi = MagicMock()
     response = MagicMock()
     response.choices = [MagicMock()]
     response.choices[0].message.content = (
@@ -20,7 +20,7 @@ def mock_kimi():
         "PR #123: Good quality, score 8/10\n"
         "*Daily Overall Score*: 8/10"
     )
-    kimi.chat.return_value = response
+    kimi.chat = AsyncMock(return_value=response)
     kimi.extract_usage.return_value = (500, 200)
     return kimi
 
