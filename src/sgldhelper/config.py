@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     ci_approve_auto_ci_users: list[str] = Field(
         default=["mickqian", "bbuf"],
     )
-    ci_approve_auto_ci_max_retries: int = 3
+    ci_approve_auto_ci_max_retries: int = 2
     ci_nvidia_workflow_id: int = 115218617
     ci_amd_workflow_id: int = 119055250
 
@@ -100,4 +100,3 @@ class Settings(BaseSettings):
     @property
     def github_repo_name(self) -> str:
         return self.github_repo.split("/")[1]
-
