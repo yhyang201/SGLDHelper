@@ -56,6 +56,7 @@ class Settings(BaseSettings):
         default=["mickqian", "bbuf"],
     )
     ci_approve_auto_ci_max_retries: int = 2
+    ci_max_rerun_comments: int = 4
     ci_nvidia_workflow_id: int = 115218617
     ci_amd_workflow_id: int = 119055250
 
