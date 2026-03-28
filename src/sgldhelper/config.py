@@ -42,8 +42,8 @@ class Settings(BaseSettings):
     # Cold start: max PRs to fetch on first run (when classification cache is empty)
     cold_start_max_prs: int = 500
 
-    # Diffusion PR summary interval (seconds), default 2 hours
-    diffusion_summary_interval: int = 7200
+    # Diffusion PR summary interval (seconds), default 8 hours
+    diffusion_summary_interval: int = 28800
 
     # CI monitoring
     ci_poll_interval: int = 300
@@ -74,8 +74,8 @@ class Settings(BaseSettings):
     # Tracked PR summary interval (seconds), default 12 hours
     tracked_pr_summary_interval: int = 43200
 
-    # PR health check interval (seconds), default 2 hours
-    pr_health_check_interval: int = 7200
+    # PR health check interval (seconds), default 8 hours
+    pr_health_check_interval: int = 28800
 
     # Code quality report poll interval (seconds), default 1 hour
     # The report runs at most once per day; this is how often we check if it's time
