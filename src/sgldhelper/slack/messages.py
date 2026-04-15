@@ -337,25 +337,62 @@ def build_tracked_pr_summary(
 # AI-related messages
 # ---------------------------------------------------------------------------
 
-def build_code_quality_report(report: str, pr_count: int) -> dict[str, Any]:
-    """Build a daily code quality report message."""
+def build_code_quality_report(
+    report: str,
+    pr_count: int,
+    alert_prs: list[dict[str, Any]] | None = None,
+    alert_user_ids: list[str] | None = None,
+    repo: str = "",
+) -> dict[str, Any]:
+    """Build a daily code quality report message.
+
+    If *alert_prs* is non-empty and *alert_user_ids* is configured,
+    appends a :rotating_light: alert block with @mentions.
+    """
     text = f"Daily Code Quality Report ({pr_count} PRs)"
-    return {
-        "text": text,
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f":mag: *Daily Code Quality Report*\n"
-                        f"_{pr_count} diffusion PR(s) merged today_\n\n"
-                        f"{report}"
-                    ),
-                },
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":mag: *Daily Code Quality Report*\n"
+                    f"_{pr_count} diffusion PR(s) merged today_\n\n"
+                    f"{report}"
+                ),
             },
-        ],
-    }
+        },
+    ]
+
+    if alert_prs and alert_user_ids:
+        mentions = _mention_users(alert_user_ids)
+        alert_lines: list[str] = []
+        for p in alert_prs:
+            pr_num = p.get("pr", "?")
+            score = p.get("score", "?")
+            reason = p.get("reason", "")
+            url = _pr_url(repo, pr_num) if repo and isinstance(pr_num, int) else f"#{pr_num}"
+            link = f"<{url}|PR #{pr_num}>" if repo and isinstance(pr_num, int) else f"PR #{pr_num}"
+            line = f"• {link} — score *{score}/10*"
+            if reason:
+                line += f": {reason}"
+            alert_lines.append(line)
+
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":rotating_light: *Code Quality Alert*\n"
+                    f"以下 PR 评分极低，需要关注:\n"
+                    f"{''.join(chr(10) + l for l in alert_lines)}\n\n"
+                    f"cc {mentions}"
+                ),
+            },
+        })
+
+    return {"text": text, "blocks": blocks}
 
 
 def build_progress_confirmation(result: dict[str, Any]) -> dict[str, Any]:
