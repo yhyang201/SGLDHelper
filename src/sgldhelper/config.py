@@ -42,8 +42,8 @@ class Settings(BaseSettings):
     # Cold start: max PRs to fetch on first run (when classification cache is empty)
     cold_start_max_prs: int = 500
 
-    # Diffusion PR summary interval (seconds), default 2 hours
-    diffusion_summary_interval: int = 7200
+    # Diffusion PR summary interval (seconds), default 8 hours
+    diffusion_summary_interval: int = 28800
 
     # CI monitoring
     ci_poll_interval: int = 300
@@ -55,7 +55,8 @@ class Settings(BaseSettings):
     ci_approve_auto_ci_users: list[str] = Field(
         default=["mickqian", "bbuf"],
     )
-    ci_approve_auto_ci_max_retries: int = 3
+    ci_approve_auto_ci_max_retries: int = 2
+    ci_max_rerun_comments: int = 4
     ci_nvidia_workflow_id: int = 115218617
     ci_amd_workflow_id: int = 119055250
 
@@ -73,8 +74,8 @@ class Settings(BaseSettings):
     # Tracked PR summary interval (seconds), default 12 hours
     tracked_pr_summary_interval: int = 43200
 
-    # PR health check interval (seconds), default 2 hours
-    pr_health_check_interval: int = 7200
+    # PR health check interval (seconds), default 8 hours
+    pr_health_check_interval: int = 28800
 
     # Code quality report poll interval (seconds), default 1 hour
     # The report runs at most once per day; this is how often we check if it's time
@@ -104,4 +105,3 @@ class Settings(BaseSettings):
     @property
     def github_repo_name(self) -> str:
         return self.github_repo.split("/")[1]
-

@@ -519,3 +519,92 @@ class TestApproveAutoCI:
         self._setup_pr(mock_gh, settings, has_label=False, approver="bbuf")
         await ci_monitor._check_untracked_pr(19876)
         mock_gh.create_issue_comment.assert_called_once_with(19876, "/tag-and-rerun-ci")
+
+
+class TestRerunCommentLimit:
+    """Test that /rerun-failed-ci is limited to ci_max_rerun_comments per PR per SHA."""
+
+    @pytest.mark.asyncio
+    async def test_global_limit_stops_rerun(self, ci_monitor, mock_gh, db, settings):
+        """After ci_max_rerun_comments reruns, no more /rerun-failed-ci should be posted."""
+        from sgldhelper.db import queries
+
+        pr_number = 19876
+        head_sha = "abc123def456"
+
+        # Seed snapshot with rerun_comment_count at the limit
+        await queries.upsert_ci_snapshot(
+            db.conn, pr_number, head_sha,
+            overall_status="failed",
+            has_run_ci_label=True,
+            failed_jobs=json.dumps(["build"]),
+            snapshot_data=json.dumps({"rerun_comment_count": settings.ci_max_rerun_comments}),
+        )
+
+        posted = await ci_monitor._post_rerun_comment(pr_number, head_sha)
+        assert posted is False
+        mock_gh.create_issue_comment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_global_limit_allows_under_limit(self, ci_monitor, mock_gh, db, settings):
+        """Should post /rerun-failed-ci when under the limit."""
+        from sgldhelper.db import queries
+
+        pr_number = 19876
+        head_sha = "abc123def456"
+
+        await queries.upsert_ci_snapshot(
+            db.conn, pr_number, head_sha,
+            overall_status="failed",
+            has_run_ci_label=True,
+            failed_jobs=json.dumps(["build"]),
+            snapshot_data=json.dumps({"rerun_comment_count": settings.ci_max_rerun_comments - 1}),
+        )
+
+        posted = await ci_monitor._post_rerun_comment(pr_number, head_sha)
+        assert posted is True
+        mock_gh.create_issue_comment.assert_called_once_with(pr_number, "/rerun-failed-ci")
+
+        # Verify count was incremented
+        snapshot = await queries.get_ci_snapshot(db.conn, pr_number, head_sha)
+        data = json.loads(snapshot["snapshot_data"])
+        assert data["rerun_comment_count"] == settings.ci_max_rerun_comments
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_in_single_poll_tracked_pr(self, ci_monitor, mock_gh, db, settings):
+        """Tracked PR: approve_auto_ci rerun should prevent _poll_single_pr retry path."""
+        from sgldhelper.db import queries
+
+        pr_number = 19876
+        head_sha = "abc123def456"
+
+        # Setup: approved by configured user, CI failed, run-ci label
+        mock_gh.get_pull_reviews = AsyncMock(return_value=[
+            {"user": {"login": "mickqian"}, "state": "APPROVED"},
+        ])
+        mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
+            {
+                "id": 100,
+                "workflow_id": settings.ci_nvidia_workflow_id,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ])
+        mock_gh.get_workflow_run_jobs = AsyncMock(return_value=[
+            {"name": "build", "status": "completed", "conclusion": "failure", "id": 1},
+        ])
+
+        # First poll: posts /tag-and-rerun-ci (approve_auto_ci_started)
+        await ci_monitor._poll_single_pr(pr_number, ["U001"])
+        assert mock_gh.create_issue_comment.call_args_list[-1] == \
+            ((pr_number, "/tag-and-rerun-ci"),)
+
+        # Second poll: approve_auto_ci should post /rerun-failed-ci, but _poll_single_pr
+        # retry path should NOT post a second one
+        mock_gh.create_issue_comment.reset_mock()
+        await ci_monitor._poll_single_pr(pr_number, ["U001"])
+        rerun_calls = [
+            c for c in mock_gh.create_issue_comment.call_args_list
+            if c == ((pr_number, "/rerun-failed-ci"),)
+        ]
+        assert len(rerun_calls) == 1, f"Expected exactly 1 rerun comment, got {len(rerun_calls)}"
