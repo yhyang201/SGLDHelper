@@ -180,7 +180,7 @@ class TestTriggerCI:
 
     @pytest.mark.asyncio
     async def test_trigger_with_label(self, ci_monitor, mock_gh, settings):
-        """Should comment /rerun-failed-ci when run-ci label exists and CI failed."""
+        """Should rerun failed jobs via API when run-ci label exists and CI failed."""
         mock_gh.get_workflow_runs_for_ref = AsyncMock(return_value=[
             {
                 "id": 100,
@@ -190,7 +190,7 @@ class TestTriggerCI:
             },
         ])
         await ci_monitor.trigger_ci(19876, has_label=True)
-        mock_gh.create_issue_comment.assert_called_once_with(19876, "/rerun-failed-ci")
+        mock_gh.rerun_failed_jobs.assert_called_once_with(100)
 
 
 class TestHighPriority:
@@ -386,17 +386,17 @@ class TestOwnerRerun:
 
     @pytest.mark.asyncio
     async def test_owner_rerun_triggers_retry(self, ci_monitor, mock_gh, db, settings):
-        """Should comment /rerun-failed-ci when owner commented /tag-and-rerun-ci."""
+        """Should rerun failed jobs via API when owner commented /tag-and-rerun-ci."""
         self._setup_failed_ci(mock_gh, settings)
         await ci_monitor._check_untracked_pr(19876)
-        mock_gh.create_issue_comment.assert_called_once_with(19876, "/rerun-failed-ci")
+        mock_gh.rerun_failed_jobs.assert_called_once_with(1)
 
     @pytest.mark.asyncio
     async def test_owner_rerun_no_comment_no_retry(self, ci_monitor, mock_gh, db, settings):
-        """Should NOT comment /rerun-failed-ci when owner has not commented."""
+        """Should NOT rerun when owner has not commented."""
         self._setup_failed_ci(mock_gh, settings, with_owner_comment=False)
         await ci_monitor._check_untracked_pr(19876)
-        mock_gh.create_issue_comment.assert_not_called()
+        mock_gh.rerun_failed_jobs.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_owner_rerun_respects_max_retries(self, ci_monitor, mock_gh, db, settings):
@@ -410,7 +410,7 @@ class TestOwnerRerun:
             await queries.increment_ci_retry(db.conn, 19876, "abc123def456", "test-gpu")
 
         await ci_monitor._check_untracked_pr(19876)
-        mock_gh.create_issue_comment.assert_not_called()
+        mock_gh.rerun_failed_jobs.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_owner_rerun_caches_comment_check(self, ci_monitor, mock_gh, db, settings):
@@ -481,15 +481,16 @@ class TestApproveAutoCI:
     @pytest.mark.asyncio
     async def test_ci_failed_retries(self, ci_monitor, mock_gh, db, settings):
         """When approved and CI failed: first poll posts /tag-and-rerun-ci,
-        second poll posts /rerun-failed-ci."""
+        second poll reruns failed jobs via API."""
         self._setup_pr(mock_gh, settings, has_label=True, ci_failed=True)
         # First poll: always comment /tag-and-rerun-ci on first approval
         await ci_monitor._check_untracked_pr(19876)
         mock_gh.create_issue_comment.assert_called_once_with(19876, "/tag-and-rerun-ci")
-        # Second poll: initial comment already posted, CI still failed → retry
+        mock_gh.rerun_failed_jobs.assert_not_called()
+        # Second poll: initial comment already posted, CI still failed → rerun via API
         mock_gh.create_issue_comment.reset_mock()
         await ci_monitor._check_untracked_pr(19876)
-        mock_gh.create_issue_comment.assert_called_once_with(19876, "/rerun-failed-ci")
+        mock_gh.rerun_failed_jobs.assert_called_once_with(1)
 
     @pytest.mark.asyncio
     async def test_ci_failed_respects_max_retries(self, ci_monitor, mock_gh, db, settings):
@@ -499,12 +500,12 @@ class TestApproveAutoCI:
         self._setup_pr(mock_gh, settings, has_label=True, ci_failed=True)
         # Simulate that /tag-and-rerun-ci was already posted and retries are exhausted
         await ci_monitor._check_untracked_pr(19876)  # posts /tag-and-rerun-ci
-        mock_gh.create_issue_comment.reset_mock()
+        mock_gh.rerun_failed_jobs.reset_mock()
         for _ in range(settings.ci_approve_auto_ci_max_retries):
             await queries.increment_ci_retry(db.conn, 19876, "abc123def456", "build")
 
         await ci_monitor._check_untracked_pr(19876)
-        mock_gh.create_issue_comment.assert_not_called()
+        mock_gh.rerun_failed_jobs.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_configured_user_no_action(self, ci_monitor, mock_gh, db, settings):
@@ -521,12 +522,12 @@ class TestApproveAutoCI:
         mock_gh.create_issue_comment.assert_called_once_with(19876, "/tag-and-rerun-ci")
 
 
-class TestRerunCommentLimit:
-    """Test that /rerun-failed-ci is limited to ci_max_rerun_comments per PR per SHA."""
+class TestRerunLimit:
+    """Test that API reruns are limited to ci_max_rerun_comments per PR per SHA."""
 
     @pytest.mark.asyncio
     async def test_global_limit_stops_rerun(self, ci_monitor, mock_gh, db, settings):
-        """After ci_max_rerun_comments reruns, no more /rerun-failed-ci should be posted."""
+        """After ci_max_rerun_comments reruns, no more API reruns should be triggered."""
         from sgldhelper.db import queries
 
         pr_number = 19876
@@ -541,13 +542,13 @@ class TestRerunCommentLimit:
             snapshot_data=json.dumps({"rerun_comment_count": settings.ci_max_rerun_comments}),
         )
 
-        posted = await ci_monitor._post_rerun_comment(pr_number, head_sha)
+        posted = await ci_monitor._rerun_failed_runs(pr_number, head_sha, [100])
         assert posted is False
-        mock_gh.create_issue_comment.assert_not_called()
+        mock_gh.rerun_failed_jobs.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_global_limit_allows_under_limit(self, ci_monitor, mock_gh, db, settings):
-        """Should post /rerun-failed-ci when under the limit."""
+        """Should rerun via API when under the limit."""
         from sgldhelper.db import queries
 
         pr_number = 19876
@@ -561,9 +562,9 @@ class TestRerunCommentLimit:
             snapshot_data=json.dumps({"rerun_comment_count": settings.ci_max_rerun_comments - 1}),
         )
 
-        posted = await ci_monitor._post_rerun_comment(pr_number, head_sha)
+        posted = await ci_monitor._rerun_failed_runs(pr_number, head_sha, [100])
         assert posted is True
-        mock_gh.create_issue_comment.assert_called_once_with(pr_number, "/rerun-failed-ci")
+        mock_gh.rerun_failed_jobs.assert_called_once_with(100)
 
         # Verify count was incremented
         snapshot = await queries.get_ci_snapshot(db.conn, pr_number, head_sha)
@@ -599,12 +600,9 @@ class TestRerunCommentLimit:
         assert mock_gh.create_issue_comment.call_args_list[-1] == \
             ((pr_number, "/tag-and-rerun-ci"),)
 
-        # Second poll: approve_auto_ci should post /rerun-failed-ci, but _poll_single_pr
-        # retry path should NOT post a second one
-        mock_gh.create_issue_comment.reset_mock()
+        # Second poll: approve_auto_ci should rerun via API, but _poll_single_pr
+        # retry path should NOT trigger a second rerun
+        mock_gh.rerun_failed_jobs.reset_mock()
         await ci_monitor._poll_single_pr(pr_number, ["U001"])
-        rerun_calls = [
-            c for c in mock_gh.create_issue_comment.call_args_list
-            if c == ((pr_number, "/rerun-failed-ci"),)
-        ]
-        assert len(rerun_calls) == 1, f"Expected exactly 1 rerun comment, got {len(rerun_calls)}"
+        assert mock_gh.rerun_failed_jobs.call_count == 1, \
+            f"Expected exactly 1 API rerun, got {mock_gh.rerun_failed_jobs.call_count}"

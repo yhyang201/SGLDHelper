@@ -212,11 +212,11 @@ class CIMonitor:
         return count < max_retries
 
     async def trigger_ci(self, pr_number: int, has_label: bool) -> dict[str, Any]:
-        """Trigger CI via PR comment. Uses lock to prevent concurrent triggers.
+        """Trigger CI for a PR. Uses lock to prevent concurrent triggers.
 
         Returns a dict describing what actually happened:
-        - method: "comment" (always comments now)
-        - rerun_ids: list of run IDs that had failures (for which /rerun-failed-ci was posted)
+        - method: "comment" or "api"
+        - rerun_ids: list of run IDs that had failures (rerun via API)
         - skipped_runs: list of {run_id, status, conclusion} for runs that were
           skipped (matched workflow but didn't meet rerun criteria)
         """
@@ -226,7 +226,7 @@ class CIMonitor:
                 log.info("ci.triggered_via_comment", pr=pr_number)
                 return {"method": "comment", "rerun_ids": [], "skipped_runs": []}
 
-            # If label exists, find runs and rerun failed
+            # If label exists, find runs and rerun failed via API
             pr_data = await self._gh.get_pull(pr_number)
             sha = pr_data["head"]["sha"]
             runs = await self._gh.get_workflow_runs_for_ref(sha)
@@ -263,9 +263,9 @@ class CIMonitor:
                     )
 
             if has_failed:
-                posted = await self._post_rerun_comment(pr_number, sha)
+                posted = await self._rerun_failed_runs(pr_number, sha, rerun_ids)
                 if posted:
-                    log.info("ci.rerun_via_comment", pr=pr_number, run_ids=rerun_ids)
+                    log.info("ci.rerun_via_api", pr=pr_number, run_ids=rerun_ids)
             elif not skipped_runs:
                 log.warning(
                     "ci.no_matching_runs",
@@ -274,7 +274,7 @@ class CIMonitor:
                     total_runs=len(runs),
                 )
 
-            return {"method": "comment", "rerun_ids": rerun_ids, "skipped_runs": skipped_runs}
+            return {"method": "api", "rerun_ids": rerun_ids, "skipped_runs": skipped_runs}
 
     async def poll_all_tracked_prs(self) -> None:
         """Poll CI for all tracked PRs. Called by the CI poller."""
@@ -292,7 +292,7 @@ class CIMonitor:
         """Check all open diffusion PRs (not tracked) for:
 
         1. All CI passed + approved → ping
-        2. Owner-rerun: mickqian commented /tag-and-rerun-ci → auto-retry on failure
+        2. Owner-rerun: mickqian commented /tag-and-rerun-ci → auto-retry via API
 
         Tracked PRs are already covered by ``_poll_single_pr``.
         """
@@ -384,7 +384,7 @@ class CIMonitor:
         """Auto-retry failed CI if the owner (ci_high_priority_ping_user) has
         commented /tag-and-rerun-ci on this PR. Max ci_owner_rerun_max_retries.
 
-        Returns True if /rerun-failed-ci was posted.
+        Returns True if failed jobs were rerun via the API.
         """
         owner = self._settings.ci_high_priority_ping_user
 
@@ -428,7 +428,8 @@ class CIMonitor:
                 )
 
         if should_rerun:
-            posted = await self._post_rerun_comment(pr_number, head_sha)
+            run_ids = [j.run_id for j in ci_status.failed_jobs]
+            posted = await self._rerun_failed_runs(pr_number, head_sha, run_ids)
             if posted:
                 log.info("ci_monitor.owner_rerun_triggered",
                          pr=pr_number, owner=owner)
@@ -440,10 +441,10 @@ class CIMonitor:
     ) -> bool:
         """If an approved-by user (mickqian/bbuf) approved this PR:
         - Always comment /tag-and-rerun-ci (once per SHA)
-        - CI failed → comment /rerun-failed-ci (up to ci_approve_auto_ci_max_retries)
+        - CI failed → rerun failed jobs via API (up to ci_approve_auto_ci_max_retries)
 
-        Returns True if it acted (posted any comment — either /tag-and-rerun-ci
-        or /rerun-failed-ci), signalling callers to skip further rerun logic.
+        Returns True if it acted (posted /tag-and-rerun-ci comment or triggered
+        API rerun), signalling callers to skip further rerun logic.
         """
         # Check if any configured user approved
         reviews = await self._gh.get_pull_reviews(pr_number)
@@ -472,7 +473,7 @@ class CIMonitor:
             )
             return True  # CI just kicked off; callers should skip further rerun logic
 
-        # CI failed → retry (only after initial /tag-and-rerun-ci was already posted)
+        # CI failed → retry via API (only after initial /tag-and-rerun-ci was already posted)
         if (
             ci_status.overall == CIOverallStatus.FAILED
             and ci_status.all_runs_completed
@@ -489,38 +490,52 @@ class CIMonitor:
                         self._db.conn, pr_number, head_sha, job.job_name
                     )
             if should_rerun:
-                posted = await self._post_rerun_comment(pr_number, head_sha)
+                run_ids = [j.run_id for j in ci_status.failed_jobs]
+                posted = await self._rerun_failed_runs(pr_number, head_sha, run_ids)
                 if posted:
                     log.info("ci_monitor.approve_auto_ci_retried", pr=pr_number)
                 return posted
         return False
 
-    async def _post_rerun_comment(self, pr_number: int, head_sha: str) -> bool:
-        """Post /rerun-failed-ci if the global per-PR limit has not been reached.
+    async def _rerun_failed_runs(
+        self, pr_number: int, head_sha: str, run_ids: list[int],
+    ) -> bool:
+        """Rerun failed jobs via the GitHub API if the global per-PR limit
+        has not been reached.
 
         Tracks the count in ``snapshot_data["rerun_comment_count"]``.
-        Returns True if the comment was posted, False if the limit was hit.
+        Returns True if reruns were triggered, False if the limit was hit
+        or *run_ids* is empty.
         """
+        if not run_ids:
+            return False
+
         snapshot = await queries.get_ci_snapshot(self._db.conn, pr_number, head_sha)
         snapshot_data = self._load_snapshot_data(snapshot)
         count = snapshot_data.get("rerun_comment_count", 0)
-        max_comments = self._settings.ci_max_rerun_comments
+        max_reruns = self._settings.ci_max_rerun_comments
 
-        if count >= max_comments:
+        if count >= max_reruns:
             log.warning(
-                "ci_monitor.rerun_comment_limit_reached",
+                "ci_monitor.rerun_limit_reached",
                 pr=pr_number,
                 head_sha=head_sha,
                 count=count,
-                limit=max_comments,
+                limit=max_reruns,
             )
             return False
 
-        try:
-            await self._gh.create_issue_comment(pr_number, "/rerun-failed-ci")
-        except Exception:
-            log.exception("ci_monitor.rerun_comment_failed", pr=pr_number)
-            return False
+        unique_run_ids = sorted(set(run_ids))
+        for rid in unique_run_ids:
+            try:
+                await self._gh.rerun_failed_jobs(rid)
+                log.info("ci_monitor.rerun_failed_jobs_api", pr=pr_number, run_id=rid)
+            except Exception:
+                log.exception(
+                    "ci_monitor.rerun_failed_jobs_api_failed",
+                    pr=pr_number, run_id=rid,
+                )
+                return False
 
         snapshot_data["rerun_comment_count"] = count + 1
         await queries.upsert_ci_snapshot(
@@ -658,16 +673,16 @@ class CIMonitor:
                 else:
                     permanent.append(job)
 
-            # Skip rerun if approve_auto_ci already posted one this poll
+            # Skip rerun if approve_auto_ci already triggered one this poll
             if retryable and not rerun_posted:
-                # Comment to trigger rerun
                 for job in retryable:
                     await queries.increment_ci_retry(
                         self._db.conn, pr_number, head_sha, job.job_name
                     )
-                posted = await self._post_rerun_comment(pr_number, head_sha)
+                run_ids = [j.run_id for j in retryable]
+                posted = await self._rerun_failed_runs(pr_number, head_sha, run_ids)
                 if posted:
-                    log.info("ci_monitor.rerun_via_comment", pr=pr_number)
+                    log.info("ci_monitor.rerun_via_api", pr=pr_number)
 
                 if self._on_ci_failed_retrying:
                     await self._on_ci_failed_retrying(pr_number, user_ids, retryable)
